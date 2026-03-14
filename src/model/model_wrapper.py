@@ -469,6 +469,7 @@ class ModelWrapper(LightningModule):
         self.benchmarker.dump_stats(
             self.test_cfg.output_path / name / "stats.json"
         )
+        nan_scenes = []
         for i in range(min(len(self.test_scene_list), len(self.test_fvs_list))):
             if self.test_fvs_list[i]:
                 print(self.test_scene_list[i], self.benchmarker.benchmarks['psnr_inter'][i], 
@@ -489,6 +490,8 @@ class ModelWrapper(LightningModule):
                                 self.benchmarker.benchmarks['depth_rel_diff'][i],
                                 self.benchmarker.benchmarks['depth_delta_25'][i],
                                 self.benchmarker.benchmarks['depth_delta_10'][i])
+            if np.isnan(self.benchmarker.benchmarks['depth_abs_diff'][i]) or np.isnan(self.benchmarker.benchmarks['depth_rel_diff'][i]) or np.isnan(self.benchmarker.benchmarks['depth_delta_25'][i]) or np.isnan(self.benchmarker.benchmarks['depth_delta_10'][i]):
+                nan_scenes.append(self.test_scene_list[i])
         print('psnr_inter_avg:', (np.array(self.benchmarker.benchmarks['psnr_inter']) 
                                 * np.array(self.benchmarker.benchmarks['num_inter'])).sum()
                                 / np.array(self.benchmarker.benchmarks['num_inter']).sum(), 
@@ -515,6 +518,8 @@ class ModelWrapper(LightningModule):
         except:
             pass
         print('num_gaussians_avg:', self.benchmarker.benchmarks['num_gaussians_avg'])
+        if len(nan_scenes) > 0:
+            print('nan_depth_scenes:', nan_scenes)
 
     @rank_zero_only
     def validation_step(self, batch, batch_idx):

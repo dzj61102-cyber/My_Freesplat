@@ -37,7 +37,7 @@ class Benchmarker:
         path.parent.mkdir(exist_ok=True, parents=True)
         new_benchmarks = self.benchmarks.copy()
         for tag in self.benchmarks.keys():
-            new_benchmarks[tag+'_avg'] = np.mean(self.benchmarks[tag])
+            new_benchmarks[tag+'_avg'] = np.nanmean(np.asarray(self.benchmarks[tag], dtype=float))
         with path.open("w") as f:
             json.dump(new_benchmarks, f)
         self.benchmarks = new_benchmarks
