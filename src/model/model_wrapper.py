@@ -579,6 +579,8 @@ class ModelWrapper(LightningModule):
         tag, rgb = "probabilistic", rgb_probabilistic
         psnr, lpips, ssim, num = compute_metrics(rgb_gt, rgb)
         self.log(f"val/psnr_{tag}", psnr)
+        if tag == "probabilistic":
+            self.log("val_psnr_probabilistic", psnr, prog_bar=True, logger=True)
         self.log(f"val/lpips_{tag}", lpips)
         self.log(f"val/ssim_{tag}", ssim)
         abs_diff, rel_diff, delta_25, delta_10 = depth_render_metrics(output_probabilistic, batch)

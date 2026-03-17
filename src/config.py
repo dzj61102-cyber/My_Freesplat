@@ -20,6 +20,10 @@ class CheckpointingCfg:
     load: Optional[str]  # Not a path, since it could be something like wandb://...
     every_n_train_steps: int
     save_top_k: int
+    monitor: str = "val_psnr_probabilistic"
+    mode: str = "max"
+    save_last: bool = True
+    filename: str = "best-step={step:06d}-{val_psnr_probabilistic:.4f}"
 
 
 @dataclass
@@ -94,5 +98,4 @@ def load_typed_root_config(cfg: DictConfig) -> RootCfg:
         rootcfg,
         {list[LossCfgWrapper]: separate_loss_cfg_wrappers},
     )
-
 
