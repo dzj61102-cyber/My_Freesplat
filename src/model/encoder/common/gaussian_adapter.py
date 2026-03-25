@@ -148,7 +148,7 @@ class GaussianAdapter(nn.Module):
         device = extrinsics.device
         h, w = image_shape
 
-        if not fusion:
+        if not fusion:# fusion = False
             scales, rotations, sh = raw_gaussians.split((3, 4, 3 * self.d_sh), dim=-1)
 
             # Map scale features to valid scale range.

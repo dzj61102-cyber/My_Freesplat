@@ -23,7 +23,7 @@ class CheckpointingCfg:
     monitor: str = "val_psnr_probabilistic"
     mode: str = "max"
     save_last: bool = True
-    filename: str = "best-step={step:06d}-{val_psnr_probabilistic:.4f}"
+    filename: str = "best_step_{step:06d}_{val_psnr_probabilistic:.4f}"
 
 
 @dataclass

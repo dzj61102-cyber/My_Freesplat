@@ -48,7 +48,7 @@ checkpointing:
   monitor: val_psnr_probabilistic
   mode: max
   save_last: true
-  filename: best-step={step:06d}-{val_psnr_probabilistic:.4f}
+  filename: best_step_{step:06d}_{val_psnr_probabilistic:.4f}
 
 train:
   load_depth: null

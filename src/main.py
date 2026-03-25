@@ -86,11 +86,26 @@ def train(cfg_dict: DictConfig):
             save_top_k=cfg.checkpointing.save_top_k,
             monitor=cfg.checkpointing.monitor,
             mode=cfg.checkpointing.mode,
-            save_last=cfg.checkpointing.save_last,
+            save_last=False,
             filename=cfg.checkpointing.filename,
             auto_insert_metric_name=False,
         )
     )
+
+    if cfg.checkpointing.save_last:
+        last_filename = cfg.checkpointing.filename.replace("best", "last", 1)
+        callbacks.append(
+            ModelCheckpoint(
+                output_dir / "checkpoints",
+                every_n_train_steps=cfg.checkpointing.every_n_train_steps,
+                save_top_k=1,
+                monitor="step",
+                mode="max",
+                save_last=False,
+                filename=last_filename,
+                auto_insert_metric_name=False,
+            )
+        )
 
     # Prepare the checkpoint for loading.
     checkpoint_path = update_checkpoint_path(cfg.checkpointing.load, cfg.wandb)

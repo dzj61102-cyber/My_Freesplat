@@ -3,7 +3,6 @@ from pathlib import Path
 
 import torch
 from pytorch_lightning import LightningModule
-from tabulate import tabulate
 
 from ..misc.image_io import load_image, save_image
 from ..visualization.annotation import add_label
@@ -18,6 +17,8 @@ class MetricComputer(LightningModule):
     def __init__(self, cfg: EvaluationCfg) -> None:
         super().__init__()
         self.cfg = cfg
+        self._test_metric_sums: dict[str, float] = {}
+        self._test_metric_count = 0
 
     def test_step(self, batch, batch_idx):
         scene = batch["scene"][0]
@@ -54,8 +55,13 @@ class MetricComputer(LightningModule):
                 f"ssim_{key}": compute_ssim(rgb_gt, images).mean(),
                 f"psnr_{key}": compute_psnr(rgb_gt, images).mean(),
             }
+
+        metrics_as_float = {
+            k: float(v.detach().cpu()) if torch.is_tensor(v) else float(v)
+            for k, v in all_metrics.items()
+        }
+        self._accumulate_test_metrics(metrics_as_float)
         self.log_dict(all_metrics)
-        self.print_preview_metrics(all_metrics)
 
         # Skip the rest if no side-by-side is needed.
         if self.cfg.side_by_side_path is None:
@@ -91,25 +97,19 @@ class MetricComputer(LightningModule):
                 f"{Path.cwd()}/{self.cfg.side_by_side_path}/videos/{scene_key}.mp4"
             )
 
-    def print_preview_metrics(self, metrics: dict[str, float]) -> None:
-        if getattr(self, "running_metrics", None) is None:
-            self.running_metrics = metrics
-            self.running_metric_steps = 1
-        else:
-            s = self.running_metric_steps
-            self.running_metrics = {
-                k: ((s * v) + metrics[k]) / (s + 1)
-                for k, v in self.running_metrics.items()
-            }
-            self.running_metric_steps += 1
+    def _accumulate_test_metrics(self, metrics: dict[str, float]) -> None:
+        for key, value in metrics.items():
+            self._test_metric_sums[key] = self._test_metric_sums.get(key, 0.0) + value
+        self._test_metric_count += 1
 
-        table = []
+    def on_test_end(self) -> None:
+        if self._test_metric_count == 0:
+            print("No valid test samples were found, skipping average metric report.")
+            return
+
+        print("Average metrics on this test set:")
         for method in self.cfg.methods:
-            row = [
-                f"{self.running_metrics[f'{metric}_{method.key}']:.3f}"
-                for metric in ("psnr", "lpips", "ssim")
-            ]
-            table.append((method.key, *row))
-
-        table = tabulate(table, ["Method", "PSNR (dB)", "LPIPS", "SSIM"])
-        print(table)
+            for metric in ("psnr", "lpips", "ssim"):
+                key = f"{metric}_{method.key}"
+                avg = self._test_metric_sums[key] / self._test_metric_count
+                print(f"{key}: {avg:.6f}")
