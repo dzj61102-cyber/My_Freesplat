@@ -36,6 +36,7 @@ from ..visualization.validation_in_3d import render_cameras, render_projections
 from .decoder.decoder import Decoder, DepthRenderingMode, DecoderOutput
 from .encoder import Encoder
 from .encoder.encoder_freesplat import UseDepthMode
+from .types import Gaussians
 from .encoder.visualization.encoder_visualizer import EncoderVisualizer
 
 
@@ -106,7 +107,9 @@ def save_gaussian_opacity_visualizations(
     output_root: Path,
     scene: str,
     max_points_3d: int = 80000,
+    suffix: str = "",
 ):
+    title_suffix = " (Pruned)" if suffix == "_pruned" else ""
     if gaussians is None:
         return
     if isinstance(gaussians, list):
@@ -135,11 +138,10 @@ def save_gaussian_opacity_visualizations(
     opacity_np = opacities.numpy()
     fig, ax = plt.subplots(figsize=(8, 5))
     ax.hist(opacity_np, bins=100, color="#3B82F6", edgecolor="black", linewidth=0.2)
-    ax.set_title(f"Global Gaussian Opacity Histogram ({scene})")
+    ax.set_title(f"Global Gaussian Opacity Histogram ({scene}){title_suffix}")
     ax.set_xlabel("Opacity")
-    ax.set_ylabel("Count")
     fig.tight_layout()
-    fig.savefig(scene_dir / "gaussian_opacity_hist.png", dpi=220)
+    fig.savefig(scene_dir / f"gaussian_opacity_hist{suffix}.png", dpi=220)
     plt.close(fig)
 
     n = means.shape[0]
@@ -164,15 +166,51 @@ def save_gaussian_opacity_visualizations(
         vmax=1.0,
         linewidths=0.0,
     )
-    ax.set_title(f"Global Gaussian Opacity in 3D ({scene})")
+    ax.set_title(f"Global Gaussian Opacity in 3D ({scene}){title_suffix}")
     ax.set_xlabel("X")
     ax.set_ylabel("Y")
     ax.set_zlabel("Z")
     cbar = fig.colorbar(scatter, ax=ax, pad=0.08, shrink=0.75)
     cbar.set_label("Opacity")
     fig.tight_layout()
-    fig.savefig(scene_dir / "gaussian_opacity_3d.png", dpi=260)
+    fig.savefig(scene_dir / f"gaussian_opacity_3d{suffix}.png", dpi=260)
     plt.close(fig)
+
+
+def prune_gaussians_by_opacity(
+    gaussians: Gaussians,
+    save_ratio: float,
+) -> Gaussians:
+    if save_ratio >= 1.0:
+        return gaussians
+
+    opacities = gaussians.opacities
+    b, g = opacities.shape
+    keep = max(1, int(np.ceil(g * save_ratio)))
+    scores = -(opacities - 1.0).abs()
+    topk = torch.topk(scores, k=keep, dim=1, largest=True).indices
+
+    means = torch.stack(
+        [gaussians.means[i].index_select(0, topk[i]) for i in range(b)], dim=0
+    )
+    covariances = torch.stack(
+        [gaussians.covariances[i].index_select(0, topk[i]) for i in range(b)], dim=0
+    )
+    harmonics = torch.stack(
+        [gaussians.harmonics[i].index_select(0, topk[i]) for i in range(b)], dim=0
+    )
+    opacities = torch.stack(
+        [gaussians.opacities[i].index_select(0, topk[i]) for i in range(b)], dim=0
+    )
+    return Gaussians(means, covariances, harmonics, opacities)
+
+
+def prune_gaussians_container_by_opacity(gaussians, save_ratio: float):
+    if save_ratio >= 1.0:
+        return gaussians
+    if isinstance(gaussians, list):
+        return [prune_gaussians_by_opacity(gs, save_ratio) for gs in gaussians]
+    return prune_gaussians_by_opacity(gaussians, save_ratio)
 
 # Compute Depth metrics at novel views.
 def depth_render_metrics(prediction, batch) -> Float[Tensor, ""]:
@@ -208,6 +246,7 @@ class OptimizerCfg:
 @dataclass
 class TestCfg:
     output_path: Path
+    save_ratio: float = 1.0
 
 
 @dataclass
@@ -392,6 +431,10 @@ class ModelWrapper(LightningModule):
 
     def test_step(self, batch, batch_idx):
         batch: BatchedExample = self.data_shim(batch)
+        if not (0.0 < self.test_cfg.save_ratio <= 1.0):
+            raise ValueError(
+                f"test.save_ratio must be in (0, 1], got {self.test_cfg.save_ratio}"
+            )
 
         b, v, _, h, w = batch["target"]["image"].shape
         assert b == 1
@@ -407,7 +450,10 @@ class ModelWrapper(LightningModule):
                 is_testing=True,
                 export_ply=self.encoder_visualizer.cfg.export_ply,
             )
-            gaussians = encoder_results['gaussians']
+            gaussians_full = encoder_results['gaussians']
+            gaussians = prune_gaussians_container_by_opacity(
+                gaussians_full, self.test_cfg.save_ratio
+            )
             
         with self.benchmarker.time("decoder", num_calls=v):
             if not isinstance(gaussians, list):
@@ -452,7 +498,8 @@ class ModelWrapper(LightningModule):
         self.test_scene_list.append(scene)
         name = get_cfg()["wandb"]["name"]
         path = self.test_cfg.output_path / name
-        save_gaussian_opacity_visualizations(encoder_results["gaussians"], path, scene)
+        save_gaussian_opacity_visualizations(gaussians_full, path, scene, suffix="")
+        save_gaussian_opacity_visualizations(gaussians, path, scene, suffix="_pruned")
         abs_diff, rel_diff, delta_25, delta_10 = depth_render_metrics(output, batch)
         print(f'abs_diff: {abs_diff}, rel_diff: {rel_diff}, delta_25: {delta_25}, delta_10: {delta_10}')
         self.benchmarker.store('depth_abs_diff', float(abs_diff.detach().cpu().numpy()))
