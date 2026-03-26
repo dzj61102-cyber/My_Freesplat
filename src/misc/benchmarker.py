@@ -30,8 +30,15 @@ class Benchmarker:
 
     def dump(self, path: Path) -> None:
         path.parent.mkdir(exist_ok=True, parents=True)
+        benchmark_dict = dict(self.execution_times)
+        mean_encoder_time = float(np.mean(benchmark_dict["encoder"])) if "encoder" in benchmark_dict and len(benchmark_dict["encoder"]) > 0 else float("nan")
+        mean_decoder_time = float(np.mean(benchmark_dict["decoder"])) if "decoder" in benchmark_dict and len(benchmark_dict["decoder"]) > 0 else float("nan")
+        fps = float(1.0 / mean_decoder_time) if np.isfinite(mean_decoder_time) and mean_decoder_time > 0 else float("nan")
+        benchmark_dict["mean_encoder_time"] = mean_encoder_time
+        benchmark_dict["mean_decoder_time"] = mean_decoder_time
+        benchmark_dict["fps"] = fps
         with path.open("w") as f:
-            json.dump(dict(self.execution_times), f)
+            json.dump(benchmark_dict, f)
     
     def dump_stats(self, path: Path) -> None:
         path.parent.mkdir(exist_ok=True, parents=True)

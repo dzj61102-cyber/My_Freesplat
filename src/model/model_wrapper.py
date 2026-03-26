@@ -615,32 +615,52 @@ class ModelWrapper(LightningModule):
                                 self.benchmarker.benchmarks['depth_delta_10'][i])
             if np.isnan(self.benchmarker.benchmarks['depth_abs_diff'][i]) or np.isnan(self.benchmarker.benchmarks['depth_rel_diff'][i]) or np.isnan(self.benchmarker.benchmarks['depth_delta_25'][i]) or np.isnan(self.benchmarker.benchmarks['depth_delta_10'][i]):
                 nan_scenes.append(self.test_scene_list[i])
-        print('psnr_inter_avg:', (np.array(self.benchmarker.benchmarks['psnr_inter']) 
-                                * np.array(self.benchmarker.benchmarks['num_inter'])).sum()
-                                / np.array(self.benchmarker.benchmarks['num_inter']).sum(), 
-            'ssim_inter_avg:', (np.array(self.benchmarker.benchmarks['ssim_inter']) 
-                                * np.array(self.benchmarker.benchmarks['num_inter'])).sum()
-                                / np.array(self.benchmarker.benchmarks['num_inter']).sum(),
-            'lpips_inter_avg:', (np.array(self.benchmarker.benchmarks['lpips_inter']) 
-                                * np.array(self.benchmarker.benchmarks['num_inter'])).sum()
-                                / np.array(self.benchmarker.benchmarks['num_inter']).sum(),
-            'depth_abs_diff_avg:', torch.nanmean(torch.tensor(self.benchmarker.benchmarks['depth_abs_diff'])).cpu().numpy(),
-            'depth_rel_diff_avg:', torch.nanmean(torch.tensor(self.benchmarker.benchmarks['depth_rel_diff'])).cpu().numpy(),
-            'depth_delta_25_avg:', torch.nanmean(torch.tensor(self.benchmarker.benchmarks['depth_delta_25'])).cpu().numpy(),
-            'depth_delta_10_avg:', torch.nanmean(torch.tensor(self.benchmarker.benchmarks['depth_delta_10'])).cpu().numpy())
+        inter_num = np.array(self.benchmarker.benchmarks['num_inter'])
+        psnr_inter_avg = (np.array(self.benchmarker.benchmarks['psnr_inter']) * inter_num).sum() / inter_num.sum()
+        ssim_inter_avg = (np.array(self.benchmarker.benchmarks['ssim_inter']) * inter_num).sum() / inter_num.sum()
+        lpips_inter_avg = (np.array(self.benchmarker.benchmarks['lpips_inter']) * inter_num).sum() / inter_num.sum()
+        depth_abs_diff_avg = torch.nanmean(torch.tensor(self.benchmarker.benchmarks['depth_abs_diff'])).cpu().numpy()
+        depth_rel_diff_avg = torch.nanmean(torch.tensor(self.benchmarker.benchmarks['depth_rel_diff'])).cpu().numpy()
+        depth_delta_25_avg = torch.nanmean(torch.tensor(self.benchmarker.benchmarks['depth_delta_25'])).cpu().numpy()
+        depth_delta_10_avg = torch.nanmean(torch.tensor(self.benchmarker.benchmarks['depth_delta_10'])).cpu().numpy()
+        mean_encoder_time = np.mean(self.benchmarker.execution_times["encoder"]) if len(self.benchmarker.execution_times["encoder"]) > 0 else float("nan")
+        mean_decoder_time = np.mean(self.benchmarker.execution_times["decoder"]) if len(self.benchmarker.execution_times["decoder"]) > 0 else float("nan")
+        fps = (1.0 / mean_decoder_time) if np.isfinite(mean_decoder_time) and mean_decoder_time > 0 else float("nan")
+        peak_memory_bytes = torch.cuda.memory_stats()["allocated_bytes.all.peak"] if torch.cuda.is_available() else 0.0
+        peak_memory_gb = peak_memory_bytes / (1024 ** 3)
+        summary_metrics = {}
+        def log_metric(key, value):
+            value = float(value)
+            print(f'{key}: {value:.3f}')
+            summary_metrics[key] = f"{value:.3f}"
+
+        log_metric('psnr_inter_avg', psnr_inter_avg)
+        log_metric('ssim_inter_avg', ssim_inter_avg)
+        log_metric('lpips_inter_avg', lpips_inter_avg)
+        log_metric('depth_abs_diff_avg', depth_abs_diff_avg)
+        log_metric('depth_rel_diff_avg', depth_rel_diff_avg)
+        log_metric('depth_delta_25_avg', depth_delta_25_avg)
+        log_metric('depth_delta_10_avg', depth_delta_10_avg)
         try:
-            print('psnr_extra_avg:', (np.array(self.benchmarker.benchmarks['psnr_extra']) 
-                                * np.array(self.benchmarker.benchmarks['num_extra'])).sum()
-                                / np.array(self.benchmarker.benchmarks['num_extra']).sum(), 
-                'ssim_extra_avg:', (np.array(self.benchmarker.benchmarks['ssim_extra']) 
-                                    * np.array(self.benchmarker.benchmarks['num_extra'])).sum()
-                                    / np.array(self.benchmarker.benchmarks['num_extra']).sum(),
-                'lpips_extra_avg:', (np.array(self.benchmarker.benchmarks['lpips_extra']) 
-                                    * np.array(self.benchmarker.benchmarks['num_extra'])).sum()
-                                    / np.array(self.benchmarker.benchmarks['num_extra']).sum())
+            extra_num = np.array(self.benchmarker.benchmarks['num_extra'])
+            psnr_extra_avg = (np.array(self.benchmarker.benchmarks['psnr_extra']) * extra_num).sum() / extra_num.sum()
+            ssim_extra_avg = (np.array(self.benchmarker.benchmarks['ssim_extra']) * extra_num).sum() / extra_num.sum()
+            lpips_extra_avg = (np.array(self.benchmarker.benchmarks['lpips_extra']) * extra_num).sum() / extra_num.sum()
+            log_metric('psnr_extra_avg', psnr_extra_avg)
+            log_metric('ssim_extra_avg', ssim_extra_avg)
+            log_metric('lpips_extra_avg', lpips_extra_avg)
         except:
             pass
-        print('num_gaussians_avg:', self.benchmarker.benchmarks['num_gaussians_avg'])
+        rendered_num_gaussians_avg = self.benchmarker.benchmarks["num_gaussians_avg"] * self.test_cfg.save_ratio
+        log_metric('num_gaussians_avg', self.benchmarker.benchmarks["num_gaussians_avg"])
+        log_metric('rendered_num_gaussians_avg', rendered_num_gaussians_avg)
+        log_metric('peak_memory_gb', peak_memory_gb)
+        log_metric('mean_encoder_time', mean_encoder_time)
+        log_metric('fps', fps)
+        summary_metrics_path = self.test_cfg.output_path / "terminal_metrics.json"
+        summary_metrics_path.parent.mkdir(parents=True, exist_ok=True)
+        with summary_metrics_path.open("w") as f:
+            json.dump(summary_metrics, f, indent=2)
         if len(nan_scenes) > 0:
             print('nan_depth_scenes:', nan_scenes)
 
