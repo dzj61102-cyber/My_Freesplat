@@ -16,9 +16,13 @@ class Benchmarker:
     @contextmanager
     def time(self, tag: str, num_calls: int = 1):
         try:
+            if torch.cuda.is_available():
+                torch.cuda.synchronize()
             start_time = time()
             yield
         finally:
+            if torch.cuda.is_available():
+                torch.cuda.synchronize()
             end_time = time()
             for _ in range(num_calls):
                 self.execution_times[tag].append((end_time - start_time) / num_calls)
