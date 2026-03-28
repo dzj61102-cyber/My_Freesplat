@@ -481,7 +481,7 @@ class EncoderFreeSplat(Encoder[EncoderFreeSplatCfg]):
         #       - 含义：全分辨率的最终深度图
         #       - shape：[B*V, 1, H, W]
         #   - output_pred_s-1_b1hw
-        #       - 含义：全分辨率后的解码特征头输出（后续高斯特征会用到其后 64 通道）
+        #       - 含义：全分辨率后的解码特征头输出（第0通道表示密度/不透明度先验/权重,后64通道是高斯特征）
         #       - shape：[B*V, 65, H, W]
         #   - depth_weights
         #       - 含义：全分辨率的深度置信度（取深度候选 softmax 后的最大概率并上采样）
@@ -574,6 +574,8 @@ class EncoderFreeSplat(Encoder[EncoderFreeSplatCfg]):
         # 5、高斯融合，逐样本
         # 把多视角、多个尺度产生的大量高斯点，按每个 batch 样本分别做“去重+融合”，再把融合后的结果整理成标准的 Gaussians 表示，最后存进 results 返回
         our_gaussians = []#每个 batch 样本融合后的高斯结果
+        fused_features = []#每个样本的全局融合特征（与最终高斯一一对应）
+        fused_weights = []#每个样本的全局融合权重（与最终高斯一一对应）
         num_raw_gaussians = gaussians[0].shape[2] * gaussians[0].shape[1]#融合前原始高斯数量V*H*W
         B = gaussians[0].shape[0]#B
         for b in range(B):
@@ -590,11 +592,24 @@ class EncoderFreeSplat(Encoder[EncoderFreeSplatCfg]):
             cur_depth = rearrange(depth_outputs[f'depth_pred_s-1_b1hw'], "(b v) c h w -> b v c h w", b=B)[b]#[B*V,1,H,W]->[B,V,1,H,W]
             
             # 按几何一致性融合：返回融合后特征/坐标/外参/深度
-            cur_gaussians, cur_coords, cur_extrinsics, cur_depths = self.fuse_gaussians(cur_gs, cur_coords, 
-                                            cur_densities, cur_weights, 
-                                            cur_depth, 
-                                            context["extrinsics"][b:b+1], \
-                                            context["intrinsics"][b:b+1], context['image_shape'])
+            (
+                cur_gaussians,
+                cur_coords,
+                cur_extrinsics,
+                cur_depths,
+                cur_fused_densities,
+            ) = self.fuse_gaussians(
+                cur_gs,
+                cur_coords,
+                cur_densities,
+                cur_weights,
+                cur_depth,
+                context["extrinsics"][b:b+1],
+                context["intrinsics"][b:b+1],
+                context['image_shape'],
+            )
+            # 记录融合后的全局特征（在映射到高斯参数之前）
+            cur_fused_features = cur_gaussians
 
             # 将融合特征映射成高斯参数
             cur_gaussians_now = rearrange(
@@ -622,8 +637,11 @@ class EncoderFreeSplat(Encoder[EncoderFreeSplatCfg]):
                 # 传入融合后坐标，避免重复反投影
                 coords=rearrange(cur_coords, "b r c -> b () r () () c"),
             )
-            # 保存当前样本融合后的高斯对象，our_gaussians = [样本0的高斯, 样本1的高斯, ...]
+            # 保存当前样本的全局高斯对象，our_gaussians = [样本0的高斯, 样本1的高斯, ...]
             our_gaussians.append(cur_gaussians)
+            # 保留融合中间量，供后续按同索引访问每个全局高斯
+            fused_features.append(cur_fused_features)
+            fused_weights.append(cur_fused_densities)
             
         # 统计融合效果
         # 融合前后高斯数量和压缩率
@@ -671,6 +689,43 @@ class EncoderFreeSplat(Encoder[EncoderFreeSplatCfg]):
                 ),
             ))
         results['gaussians'] = final_gs
+        # 与 results['gaussians'] 同列表顺序、同高斯索引的一一对应附加属性
+        results['gaussians_fused_features'] = fused_features
+        results['gaussians_fused_weights'] = [
+            rearrange(x, "b g () () -> b g") for x in fused_weights
+        ]
+        # - 对于每个样本 i，高斯索引 g 一一对应：
+        #     - results['gaussians'][i].means[:, g, ...] / covariances / harmonics / opacities
+        #     - results['gaussians_fused_features'][i][:, g, ...]
+        #     - results['gaussians_fused_weights'][i][:, g]
+
+        # 打印shape
+        gaussians_result = results['gaussians']
+        if isinstance(gaussians_result, list):
+            for idx, gs in enumerate(gaussians_result):
+                print(f"[EncoderFreeSplat] results['gaussians'][{idx}].means shape: {gs.means.shape}")
+                print(f"[EncoderFreeSplat] results['gaussians'][{idx}].covariances shape: {gs.covariances.shape}")
+                print(f"[EncoderFreeSplat] results['gaussians'][{idx}].harmonics shape: {gs.harmonics.shape}")
+                print(f"[EncoderFreeSplat] results['gaussians'][{idx}].opacities shape: {gs.opacities.shape}")
+        else:
+            print(f"[EncoderFreeSplat] results['gaussians'].means shape: {gaussians_result.means.shape}")
+            print(f"[EncoderFreeSplat] results['gaussians'].covariances shape: {gaussians_result.covariances.shape}")
+            print(f"[EncoderFreeSplat] results['gaussians'].harmonics shape: {gaussians_result.harmonics.shape}")
+            print(f"[EncoderFreeSplat] results['gaussians'].opacities shape: {gaussians_result.opacities.shape}")
+
+        fused_features_result = results['gaussians_fused_features']
+        if isinstance(fused_features_result, list):
+            for idx, x in enumerate(fused_features_result):
+                print(f"[EncoderFreeSplat] results['gaussians_fused_features'][{idx}] shape: {x.shape}")
+        else:
+            print(f"[EncoderFreeSplat] results['gaussians_fused_features'] shape: {fused_features_result.shape}")
+
+        fused_weights_result = results['gaussians_fused_weights']
+        if isinstance(fused_weights_result, list):
+            for idx, x in enumerate(fused_weights_result):
+                print(f"[EncoderFreeSplat] results['gaussians_fused_weights'][{idx}] shape: {x.shape}")
+        else:
+            print(f"[EncoderFreeSplat] results['gaussians_fused_weights'] shape: {fused_weights_result.shape}")
 
         return results
 
@@ -787,7 +842,7 @@ class EncoderFreeSplat(Encoder[EncoderFreeSplatCfg]):
                 weights_0 = global_densities[:, mask].repeat(1, 1, 1, 2)
                 weights_1 = densities[:, i, pixel_indices][:,fusion_indices_].repeat(1, 1, 1, 2)
 
-                # 位置、密度、深度权重、外参、深度做加权融合，(旧值 * 旧权重 + 新值 * 新权重) / (旧权重 + 新权重)
+                # 位置、密度（权重）、深度权重（置信度）、外参、深度做加权融合，(旧值 * 旧权重 + 新值 * 新权重) / (旧权重 + 新权重)
                 global_coords = torch.cat([global_coords[:, ~mask], (global_coords[:, mask]*weights_0[...,1] +
                                                 coords[0][:, i, pixel_indices][:,fusion_indices_,0,0]*weights_1[...,1]) / (weights_0[...,1]+weights_1[...,1])], dim=1)
                 global_densities = torch.cat([global_densities[:, ~mask], (global_densities[:, mask] +
@@ -801,6 +856,7 @@ class EncoderFreeSplat(Encoder[EncoderFreeSplatCfg]):
                                                         depths[None, i, pixel_indices][:,fusion_indices_]*weights_1[...,0,0])/(weights_0[...,0,0]+weights_1[...,0,0])], dim=1)
             
             # 把当前视角中未通过融合匹配的点直接追加到全局池
+            # 特征、位置、密度、深度权重、外参、深度
             global_gaussians = torch.cat([global_gaussians, gaussians[0][:,i]\
                                                 [:,~fusion_mask]], dim=1)
             global_coords = torch.cat([global_coords, coords[0][:,i]\
@@ -814,5 +870,5 @@ class EncoderFreeSplat(Encoder[EncoderFreeSplatCfg]):
             global_depths = torch.cat([global_depths, depths[None,i]\
                                                 [:,~fusion_mask]], dim=1)
 
-        # 返回融合后的特征、坐标、外参、深度
-        return global_gaussians, global_coords, global_extrinsics, global_depths
+        # 返回融合后的特征、坐标、外参、深度和融合权重
+        return global_gaussians, global_coords, global_extrinsics, global_depths, global_densities
