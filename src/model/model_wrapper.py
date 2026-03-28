@@ -102,10 +102,11 @@ def compute_metrics(rgb_gt, rgb):
     return psnr, lpips, ssim, num
 
 
-def save_gaussian_opacity_visualizations(
+def save_gaussian_metric_visualizations(
     gaussians,
     output_root: Path,
     scene: str,
+    pruning_mode: int,
     max_points_3d: int = 80000,
     suffix: str = "",
 ):
@@ -119,75 +120,117 @@ def save_gaussian_opacity_visualizations(
 
     means = gaussians.means
     opacities = gaussians.opacities
+    covariances = gaussians.covariances
     if means.ndim == 3:
         means = means[0]
     if opacities.ndim == 2:
         opacities = opacities[0]
+    if covariances.ndim == 4:
+        covariances = covariances[0]
 
     means = means.detach().float().cpu()
     opacities = opacities.detach().float().cpu()
+    covariances = covariances.detach().float().cpu()
     valid = torch.isfinite(means).all(dim=1) & torch.isfinite(opacities)
+    if pruning_mode == 2:
+        valid = valid & torch.isfinite(covariances).flatten(1).all(dim=1)
     if valid.sum().item() == 0:
         return
     means = means[valid]
     opacities = opacities[valid]
+    covariances = covariances[valid]
+
+    if pruning_mode in (0, 1):
+        metric_values = opacities
+        metric_name = "Opacity"
+        metric_prefix = "opacity"
+        color_min = 0.0
+        color_max = 1.0
+    elif pruning_mode == 2:
+        eigvals = torch.linalg.eigvalsh(covariances).clamp_min(0.0)
+        scale_proxy = eigvals.prod(dim=-1).pow(1.0 / 6.0)
+        metric_values = opacities * scale_proxy
+        metric_name = "Importance Score"
+        metric_prefix = "importance"
+        color_min = float(torch.quantile(metric_values, 0.01).item())
+        color_max = float(torch.quantile(metric_values, 0.99).item())
+        if color_max <= color_min:
+            color_max = color_min + 1e-6
+    else:
+        raise ValueError(f"Unsupported pruning_mode: {pruning_mode}")
 
     scene_dir = output_root / scene
     scene_dir.mkdir(parents=True, exist_ok=True)
 
-    opacity_np = opacities.numpy()
+    metric_np = metric_values.numpy()
     fig, ax = plt.subplots(figsize=(8, 5))
-    ax.hist(opacity_np, bins=100, color="#3B82F6", edgecolor="black", linewidth=0.2)
-    ax.set_title(f"Global Gaussian Opacity Histogram ({scene}){title_suffix}")
-    ax.set_xlabel("Opacity")
+    ax.hist(metric_np, bins=100, color="#3B82F6", edgecolor="black", linewidth=0.2)
+    ax.set_title(f"Global Gaussian {metric_name} Histogram ({scene}){title_suffix}")
+    ax.set_xlabel(metric_name)
     fig.tight_layout()
-    fig.savefig(scene_dir / f"gaussian_opacity_hist{suffix}.png", dpi=220)
+    fig.savefig(scene_dir / f"gaussian_{metric_prefix}_hist{suffix}.png", dpi=220)
     plt.close(fig)
 
     n = means.shape[0]
     if n > max_points_3d:
         idx = torch.randperm(n)[:max_points_3d]
         means = means[idx]
-        opacities = opacities[idx]
+        metric_values = metric_values[idx]
 
     xyz = means.numpy()
-    opacity_np = opacities.numpy()
+    metric_np = metric_values.numpy()
     fig = plt.figure(figsize=(9, 7))
     ax = fig.add_subplot(111, projection="3d")
     scatter = ax.scatter(
         xyz[:, 0],
         xyz[:, 1],
         xyz[:, 2],
-        c=opacity_np,
+        c=metric_np,
         cmap="viridis",
         s=1.2,
         alpha=0.9,
-        vmin=0.0,
-        vmax=1.0,
+        vmin=color_min,
+        vmax=color_max,
         linewidths=0.0,
     )
-    ax.set_title(f"Global Gaussian Opacity in 3D ({scene}){title_suffix}")
+    ax.set_title(f"Global Gaussian {metric_name} in 3D ({scene}){title_suffix}")
     ax.set_xlabel("X")
     ax.set_ylabel("Y")
     ax.set_zlabel("Z")
     cbar = fig.colorbar(scatter, ax=ax, pad=0.08, shrink=0.75)
-    cbar.set_label("Opacity")
+    cbar.set_label(metric_name)
     fig.tight_layout()
-    fig.savefig(scene_dir / f"gaussian_opacity_3d{suffix}.png", dpi=260)
+    fig.savefig(scene_dir / f"gaussian_{metric_prefix}_3d{suffix}.png", dpi=260)
     plt.close(fig)
 
 
-def prune_gaussians_by_opacity(
+def compute_pruning_scores(
+    gaussians: Gaussians,
+    pruning_mode: int,
+) -> Float[Tensor, "batch gaussian"]:
+    if pruning_mode == 1:
+        return gaussians.opacities
+    if pruning_mode == 2:
+        # eigvals shape: [batch, gaussian, 3]
+        eigvals = torch.linalg.eigvalsh(gaussians.covariances)
+        eigvals = eigvals.clamp_min(0.0)
+        scale_proxy = eigvals.prod(dim=-1).pow(1.0 / 6.0)
+        return gaussians.opacities * scale_proxy
+    raise ValueError(f"Unsupported pruning_mode: {pruning_mode}")
+
+
+def prune_gaussians(
     gaussians: Gaussians,
     save_ratio: float,
+    pruning_mode: int,
 ) -> Gaussians:
-    if save_ratio >= 1.0:
+    if pruning_mode == 0 or save_ratio >= 1.0:
         return gaussians
 
     opacities = gaussians.opacities
     b, g = opacities.shape
     keep = max(1, int(np.ceil(g * save_ratio)))
-    scores = -(opacities - 1.0).abs()
+    scores = compute_pruning_scores(gaussians, pruning_mode)
     topk = torch.topk(scores, k=keep, dim=1, largest=True).indices
 
     means = torch.stack(
@@ -205,12 +248,18 @@ def prune_gaussians_by_opacity(
     return Gaussians(means, covariances, harmonics, opacities)
 
 
-def prune_gaussians_container_by_opacity(gaussians, save_ratio: float):
-    if save_ratio >= 1.0:
+def prune_gaussians_container(gaussians, save_ratio: float, pruning_mode: int):
+    if pruning_mode == 0 or save_ratio >= 1.0:
         return gaussians
     if isinstance(gaussians, list):
-        return [prune_gaussians_by_opacity(gs, save_ratio) for gs in gaussians]
-    return prune_gaussians_by_opacity(gaussians, save_ratio)
+        return [prune_gaussians(gs, save_ratio, pruning_mode) for gs in gaussians]
+    return prune_gaussians(gaussians, save_ratio, pruning_mode)
+
+
+def count_gaussians(gaussians) -> int:
+    if isinstance(gaussians, list):
+        return sum(int(gs.means.shape[1]) for gs in gaussians)
+    return int(gaussians.means.shape[1])
 
 # Compute Depth metrics at novel views.
 def depth_render_metrics(prediction, batch) -> Float[Tensor, ""]:
@@ -247,6 +296,7 @@ class OptimizerCfg:
 class TestCfg:
     output_path: Path
     save_ratio: float = 1.0
+    pruning_mode: int = 0
 
 
 @dataclass
@@ -435,6 +485,10 @@ class ModelWrapper(LightningModule):
             raise ValueError(
                 f"test.save_ratio must be in (0, 1], got {self.test_cfg.save_ratio}"
             )
+        if self.test_cfg.pruning_mode not in (0, 1, 2):
+            raise ValueError(
+                f"test.pruning_mode must be one of [0, 1, 2], got {self.test_cfg.pruning_mode}"
+            )
 
         b, v, _, h, w = batch["target"]["image"].shape
         assert b == 1
@@ -451,9 +505,10 @@ class ModelWrapper(LightningModule):
                 export_ply=self.encoder_visualizer.cfg.export_ply,
             )
             gaussians_full = encoder_results['gaussians']
-            gaussians = prune_gaussians_container_by_opacity(
-                gaussians_full, self.test_cfg.save_ratio
+            gaussians = prune_gaussians_container(
+                gaussians_full, self.test_cfg.save_ratio, self.test_cfg.pruning_mode
             )
+            rendered_num_gaussians = count_gaussians(gaussians)
             
         with self.benchmarker.time("decoder", num_calls=v):
             if not isinstance(gaussians, list):
@@ -498,8 +553,20 @@ class ModelWrapper(LightningModule):
         self.test_scene_list.append(scene)
         name = get_cfg()["wandb"]["name"]
         path = self.test_cfg.output_path / name
-        save_gaussian_opacity_visualizations(gaussians_full, path, scene, suffix="")
-        save_gaussian_opacity_visualizations(gaussians, path, scene, suffix="_pruned")
+        save_gaussian_metric_visualizations(
+            gaussians_full,
+            path,
+            scene,
+            pruning_mode=self.test_cfg.pruning_mode,
+            suffix="",
+        )
+        save_gaussian_metric_visualizations(
+            gaussians,
+            path,
+            scene,
+            pruning_mode=self.test_cfg.pruning_mode,
+            suffix="_pruned",
+        )
         abs_diff, rel_diff, delta_25, delta_10 = depth_render_metrics(output, batch)
         print(f'abs_diff: {abs_diff}, rel_diff: {rel_diff}, delta_25: {delta_25}, delta_10: {delta_10}')
         self.benchmarker.store('depth_abs_diff', float(abs_diff.detach().cpu().numpy()))
@@ -559,6 +626,7 @@ class ModelWrapper(LightningModule):
             self.benchmarker.store('ssim_inter', float(ssim))
             self.benchmarker.store('num_inter', float(num))
             self.benchmarker.store('num_gaussians', encoder_results['num_gaussians'])
+            self.benchmarker.store('rendered_num_gaussians', rendered_num_gaussians)
             self.test_fvs_list.append(False)
         else:
             length = batch["target"]["index"][0].shape[0]
@@ -576,6 +644,7 @@ class ModelWrapper(LightningModule):
             self.benchmarker.store('ssim_extra', float(ssim_extra))
             self.benchmarker.store('num_extra', float(num_extra))
             self.benchmarker.store('num_gaussians', encoder_results['num_gaussians'])
+            self.benchmarker.store('rendered_num_gaussians', rendered_num_gaussians)
             self.test_fvs_list.append(True)
         if self.encoder_visualizer is not None:
             for k, image in self.encoder_visualizer.visualize(
@@ -651,7 +720,10 @@ class ModelWrapper(LightningModule):
             log_metric('lpips_extra_avg', lpips_extra_avg)
         except:
             pass
-        rendered_num_gaussians_avg = self.benchmarker.benchmarks["num_gaussians_avg"] * self.test_cfg.save_ratio
+        rendered_num_gaussians_avg = self.benchmarker.benchmarks.get(
+            "rendered_num_gaussians_avg",
+            self.benchmarker.benchmarks["num_gaussians_avg"] * self.test_cfg.save_ratio,
+        )
         log_metric('num_gaussians_avg', self.benchmarker.benchmarks["num_gaussians_avg"])
         log_metric('rendered_num_gaussians_avg', rendered_num_gaussians_avg)
         log_metric('peak_memory_gb', peak_memory_gb)

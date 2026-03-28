@@ -58,6 +58,7 @@ train:
 test:
   output_path: outputs/test
   save_ratio: 1.0
+  pruning_mode: 0
 
 seed: 111123
 
