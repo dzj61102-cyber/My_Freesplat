@@ -778,6 +778,7 @@ class EncoderFreeSplat(Encoder[EncoderFreeSplatCfg]):
                 results['gaussians_soft_gates'] = gates_per_sample
                 results['prune_budget_loss'] = cfg_prune.lambda_budget * torch.stack(budget_terms).mean()
                 results['prune_bin_loss'] = cfg_prune.lambda_bin * torch.stack(bin_terms).mean()
+                # 软门控的平均激活率，可理解为当前实际保留比例（soft）
                 results['prune_gate_ratio'] = torch.stack([x.mean() for x in gates_per_sample]).mean()
                 results['prune_tau'] = torch.tensor(
                     tau, device=device, dtype=final_gs[0].opacities.dtype

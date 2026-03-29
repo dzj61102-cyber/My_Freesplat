@@ -81,7 +81,7 @@ def train(cfg_dict: DictConfig):
 
     callbacks.append(
         ModelCheckpoint(
-            output_dir / "checkpoints",
+            output_dir / "ckpoints",
             every_n_train_steps=cfg.checkpointing.every_n_train_steps,
             save_top_k=cfg.checkpointing.save_top_k,
             monitor=cfg.checkpointing.monitor,
@@ -96,7 +96,7 @@ def train(cfg_dict: DictConfig):
         last_filename = cfg.checkpointing.filename.replace("best", "last", 1)
         callbacks.append(
             ModelCheckpoint(
-                output_dir / "checkpoints",
+                output_dir / "ckpoints",
                 every_n_train_steps=cfg.checkpointing.every_n_train_steps,
                 save_top_k=1,
                 monitor="step",
