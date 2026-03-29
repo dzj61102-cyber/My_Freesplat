@@ -54,6 +54,7 @@ train:
   load_depth: null
   depth_mode: null
   extended_visualization: false
+  train_only_importance_head: false #仅训练 Importance Head 开关配置项
 
 test:
   output_path: outputs/test

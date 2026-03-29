@@ -368,6 +368,7 @@ class TrainCfg:
     load_depth: UseDepthMode | None
     extended_visualization: bool
     has_depth: bool = False
+    train_only_importance_head: bool = False #仅训练 Importance Head 开关配置项
 
 
 @runtime_checkable
@@ -423,11 +424,38 @@ class ModelWrapper(LightningModule):
         self.decoder = decoder
         self.data_shim = get_data_shim(self.encoder)
         self.losses = nn.ModuleList(losses)
+        self.trainable_param_count = 0
 
         # This is used for testing.
         self.benchmarker = Benchmarker()
 
         self.losses_log = {}
+        # 先全冻结，再仅解冻 self.encoder.importance_head
+        if self.train_cfg.train_only_importance_head:
+            for param in self.parameters():
+                param.requires_grad = False
+            importance_head = getattr(self.encoder, "importance_head", None)
+            if importance_head is None:
+                raise ValueError(
+                    "train.train_only_importance_head=true but encoder has no importance_head."
+                )
+            for param in importance_head.parameters():
+                param.requires_grad = True
+            # 打印可训练参数名预览   
+            trainable_names = [
+                name for name, param in self.named_parameters() if param.requires_grad
+            ]
+            preview_count = min(12, len(trainable_names))
+            print(
+                f"[FreezeCheck] train_only_importance_head=True, "
+                f"trainable_tensors={len(trainable_names)}"
+            )
+            for name in trainable_names[:preview_count]:
+                print(f"[FreezeCheck] trainable: {name}")
+            if len(trainable_names) > preview_count:
+                print(
+                    f"[FreezeCheck] ... and {len(trainable_names) - preview_count} more trainable tensors"
+                )
         self.loss_total = []
         self.metrics = {}
         for metric in ['psnr', 'lpips', 'ssim']:
@@ -528,6 +556,10 @@ class ModelWrapper(LightningModule):
             total_loss = total_loss + prune_budget_loss + prune_bin_loss
             self.log("loss/prune_budget", prune_budget_loss, on_step=True, on_epoch=True, sync_dist=True, logger=True)
             self.log("loss/prune_bin", prune_bin_loss, on_step=True, on_epoch=True, sync_dist=True, logger=True)
+            self.losses_log["prune_budget"] = self.losses_log.get("prune_budget", [])
+            self.losses_log["prune_budget"].append(prune_budget_loss)
+            self.losses_log["prune_bin"] = self.losses_log.get("prune_bin", [])
+            self.losses_log["prune_bin"].append(prune_bin_loss)
             if "prune_gate_ratio" in encoder_results:
                 # gate 平均激活率（可与 keep_ratio 对比观察预算约束是否生效）。
                 self.log("prune/gate_ratio", encoder_results["prune_gate_ratio"], on_step=True, on_epoch=True, sync_dist=True, logger=True)
@@ -549,6 +581,36 @@ class ModelWrapper(LightningModule):
             if 'gs_ratio' in encoder_results:
                 to_print = to_print + f' gs_ratio = {torch.mean(torch.tensor(encoder_results["gs_ratio"])):.6f}'
             print(to_print)
+            # 训练循环中的梯度范数检查，特别关注 importance_head 和一个冻结参数的梯度。
+            if self.train_cfg.train_only_importance_head:
+                grad_head = None
+                if hasattr(self.encoder, "importance_head"):
+                    head_grads = [
+                        p.grad.detach().norm()
+                        for p in self.encoder.importance_head.parameters()
+                        if p.grad is not None
+                    ]
+                    if len(head_grads) > 0:
+                        grad_head = torch.stack(head_grads).mean().item()
+
+                grad_frozen_example = None
+                for name, param in self.named_parameters():
+                    if not param.requires_grad:
+                        if param.grad is None:
+                            grad_frozen_example = 0.0
+                        else:
+                            grad_frozen_example = float(param.grad.detach().norm().item())
+                        frozen_name = name
+                        break
+                if grad_frozen_example is None:
+                    frozen_name = "None"
+                    grad_frozen_example = -1.0
+                print(
+                    f"[FreezeCheck] step={self.global_step} "
+                    f"grad_importance_head_mean={grad_head if grad_head is not None else -1.0:.6e} "
+                    f"frozen_example={frozen_name} "
+                    f"grad_norm={grad_frozen_example:.6e}"
+                )
             self.losses_log = {}
             self.loss_total = []
             
@@ -1171,9 +1233,14 @@ class ModelWrapper(LightningModule):
                 clip.write_videofile(
                     str(dir / f"{self.global_step:0>6}.mp4"), logger=None
                 )
-
+    # 仅收集 requires_grad=True 参数，并打印可训练参数量
     def configure_optimizers(self):
-        optimizer = optim.Adam(self.parameters(), lr=self.optimizer_cfg.lr)
+        trainable_params = [p for p in self.parameters() if p.requires_grad]
+        if len(trainable_params) == 0:
+            raise ValueError("No trainable parameters found for optimizer.")
+        self.trainable_param_count = sum(p.numel() for p in trainable_params)
+        print(f"Trainable parameters: {self.trainable_param_count}")
+        optimizer = optim.Adam(trainable_params, lr=self.optimizer_cfg.lr)
         warm_up_steps = self.optimizer_cfg.warm_up_steps
         if self.optimizer_cfg.cosine_lr:
             warm_up = torch.optim.lr_scheduler.OneCycleLR(
