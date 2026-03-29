@@ -8,6 +8,15 @@ opacity_mapping:
   final: 0.0
   warm_up: 1
 
+budget_pruning:
+  enabled: true
+  keep_ratio: 0.8
+  lambda_budget: 0.2
+  lambda_bin: 0.02
+  tau_start: 0.5
+  tau_end: 0.2
+  total_steps: 300000
+
 num_surfaces: 1
 
 gaussian_adapter:

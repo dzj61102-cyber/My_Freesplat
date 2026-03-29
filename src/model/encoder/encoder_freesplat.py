@@ -48,6 +48,17 @@ class OpacityMappingCfg:
     warm_up: int
 
 
+@dataclass
+class BudgetPruningCfg:
+    enabled: bool = True
+    keep_ratio: float = 0.8
+    lambda_budget: float = 0.2
+    lambda_bin: float = 0.02
+    tau_start: float = 0.5
+    tau_end: float = 0.2
+    total_steps: int = 300000
+
+
 UseDepthMode = Literal[
     "depth"
 ]
@@ -131,6 +142,7 @@ class EncoderFreeSplatCfg:
     visualizer: EncoderVisualizerEpipolarCfg
     gaussian_adapter: GaussianAdapterCfg
     opacity_mapping: OpacityMappingCfg
+    budget_pruning: BudgetPruningCfg
     
     # 深度离散采样数量（cost volume 深度 bin）
     num_depth_candidates: int = 64
@@ -252,6 +264,25 @@ class EncoderFreeSplat(Encoder[EncoderFreeSplatCfg]):
                                     nn.Linear(12, 12),)
         # 用于多视角高斯特征融合的循环单元
         self.gru = GRU()
+
+        # 预算感知剪枝的轻量打分头：66 -> 128 -> 64 -> 1
+        self.importance_head = nn.Sequential(
+            nn.Linear(66, 128),
+            nn.GELU(),
+            nn.Linear(128, 64),
+            nn.GELU(),
+            nn.Linear(64, 1),
+        )
+
+    # 温度退火，温度呈指数规律从 tau_start(0.5) 衰减到 tau_end(0.2)
+    def _pruning_temperature(self, global_step: int) -> float:
+        cfg = self.cfg.budget_pruning
+        if cfg.total_steps <= 0:
+            return cfg.tau_end
+        progress = min(max(global_step, 0) / cfg.total_steps, 1.0)
+        tau_start = max(cfg.tau_start, 1e-6)
+        tau_end = max(cfg.tau_end, 1e-6)
+        return tau_start * ((tau_end / tau_start) ** progress)
 
     def map_pdf_to_opacity(
         self,
@@ -650,6 +681,7 @@ class EncoderFreeSplat(Encoder[EncoderFreeSplatCfg]):
         gaussians = cur_gaussians #把 gaussians 赋成了最后一个样本的 cur_gaussians
         results['num_gaussians'] = num_gaussians
 
+
         # 准备可视化数据
         visualization_dump = {}
         try:
@@ -688,44 +720,84 @@ class EncoderFreeSplat(Encoder[EncoderFreeSplatCfg]):
                     "b v r srf spp -> b (v r srf spp)",
                 ),
             ))
+        fused_weights_flat = [rearrange(x, "b g () () -> b g") for x in fused_weights]
         results['gaussians'] = final_gs
         # 与 results['gaussians'] 同列表顺序、同高斯索引的一一对应附加属性
         results['gaussians_fused_features'] = fused_features
-        results['gaussians_fused_weights'] = [
-            rearrange(x, "b g () () -> b g") for x in fused_weights
-        ]
+        results['gaussians_fused_weights'] = fused_weights_flat
         # - 对于每个样本 i，高斯索引 g 一一对应：
-        #     - results['gaussians'][i].means[:, g, ...] / covariances / harmonics / opacities
-        #     - results['gaussians_fused_features'][i][:, g, ...]
-        #     - results['gaussians_fused_weights'][i][:, g]
+        # - results['gaussians'][i].means[:, g, ...] / covariances / harmonics / opacities
+        # - results['gaussians_fused_features'][i][:, g, ...]
+        # - results['gaussians_fused_weights'][i][:, g]
+        # 例：对于样本scene0000_01_0：
+        # results['gs_ratio']: 0.5598941379123263
+        # results['num_gaussians']: 330239（融合后高斯数量）
+        # results['gaussians'][0].means shape: torch.Size([1, 330239, 3])
+        # results['gaussians'][0].covariances shape: torch.Size([1, 330239, 3, 3])
+        # results['gaussians'][0].harmonics shape: torch.Size([1, 330239, 3, 9])
+        # results['gaussians'][0].opacities shape: torch.Size([1, 330239])
+        # results['gaussians_fused_features'][0] shape: torch.Size([1, 330239, 64])
+        # results['gaussians_fused_weights'][0] shape: torch.Size([1, 330239])
+   
+        if self.cfg.budget_pruning.enabled:
+            cfg_prune = self.cfg.budget_pruning
+            tau = None if is_testing else self._pruning_temperature(global_step)
+            scores_per_sample = []
+            gates_per_sample = []
+            pruned_gaussians = []
+            budget_terms = []
+            bin_terms = []
+            # gs原始标准高斯对象, feat高斯融合特征, weight高斯融合权重
+            for gs, feat, weight in zip(final_gs, fused_features, fused_weights_flat):
+                z = torch.cat(
+                    [feat, torch.log1p(weight).unsqueeze(-1), gs.opacities.unsqueeze(-1)],
+                    dim=-1,
+                )
+                scores = self.importance_head(z).squeeze(-1)
+                scores_per_sample.append(scores)#重要性分数
+                if not is_testing:#训练软门控
+                    gates = torch.sigmoid(scores / tau)
+                    gates_per_sample.append(gates)
+                    pruned_gaussians.append(
+                        Gaussians(#剪枝后的高斯对象，opacities乘以 gates 软门控
+                            gs.means,
+                            gs.covariances,
+                            gs.harmonics,
+                            gs.opacities * gates,
+                        )
+                    )
+                    budget_terms.append((gates.mean() - cfg_prune.keep_ratio) ** 2)#预算损失，鼓励平均保留率接近目标 keep_ratio
+                    bin_terms.append((gates * (1 - gates)).mean())#二值化正则项，鼓励 gate 接近 0 或 1
+                else:#测试直接硬剪枝,不改变高斯属性
+                    pruned_gaussians.append(gs)
 
-        # 打印shape
-        gaussians_result = results['gaussians']
-        if isinstance(gaussians_result, list):
-            for idx, gs in enumerate(gaussians_result):
-                print(f"[EncoderFreeSplat] results['gaussians'][{idx}].means shape: {gs.means.shape}")
-                print(f"[EncoderFreeSplat] results['gaussians'][{idx}].covariances shape: {gs.covariances.shape}")
-                print(f"[EncoderFreeSplat] results['gaussians'][{idx}].harmonics shape: {gs.harmonics.shape}")
-                print(f"[EncoderFreeSplat] results['gaussians'][{idx}].opacities shape: {gs.opacities.shape}")
-        else:
-            print(f"[EncoderFreeSplat] results['gaussians'].means shape: {gaussians_result.means.shape}")
-            print(f"[EncoderFreeSplat] results['gaussians'].covariances shape: {gaussians_result.covariances.shape}")
-            print(f"[EncoderFreeSplat] results['gaussians'].harmonics shape: {gaussians_result.harmonics.shape}")
-            print(f"[EncoderFreeSplat] results['gaussians'].opacities shape: {gaussians_result.opacities.shape}")
+            results['gaussians'] = pruned_gaussians#原有高斯对象被覆盖
+            results['gaussians_importance_scores'] = scores_per_sample
+            results['prune_keep_ratio'] = cfg_prune.keep_ratio
+            if not is_testing:
+                results['gaussians_soft_gates'] = gates_per_sample
+                results['prune_budget_loss'] = cfg_prune.lambda_budget * torch.stack(budget_terms).mean()
+                results['prune_bin_loss'] = cfg_prune.lambda_bin * torch.stack(bin_terms).mean()
+                results['prune_gate_ratio'] = torch.stack([x.mean() for x in gates_per_sample]).mean()
+                results['prune_tau'] = torch.tensor(
+                    tau, device=device, dtype=final_gs[0].opacities.dtype
+                )
 
-        fused_features_result = results['gaussians_fused_features']
-        if isinstance(fused_features_result, list):
-            for idx, x in enumerate(fused_features_result):
-                print(f"[EncoderFreeSplat] results['gaussians_fused_features'][{idx}] shape: {x.shape}")
-        else:
-            print(f"[EncoderFreeSplat] results['gaussians_fused_features'] shape: {fused_features_result.shape}")
+        # 打印
+        # print(f"[EncoderFreeSplat] results['gs_ratio']: {results['gs_ratio']}")
+        # print(f"[EncoderFreeSplat] results['num_gaussians']: {results['num_gaussians']}")
 
-        fused_weights_result = results['gaussians_fused_weights']
-        if isinstance(fused_weights_result, list):
-            for idx, x in enumerate(fused_weights_result):
-                print(f"[EncoderFreeSplat] results['gaussians_fused_weights'][{idx}] shape: {x.shape}")
-        else:
-            print(f"[EncoderFreeSplat] results['gaussians_fused_weights'] shape: {fused_weights_result.shape}")
+        # for idx, gs in enumerate(results['gaussians']):
+        #     print(f"[EncoderFreeSplat] results['gaussians'][{idx}].means shape: {gs.means.shape}")
+        #     print(f"[EncoderFreeSplat] results['gaussians'][{idx}].covariances shape: {gs.covariances.shape}")
+        #     print(f"[EncoderFreeSplat] results['gaussians'][{idx}].harmonics shape: {gs.harmonics.shape}")
+        #     print(f"[EncoderFreeSplat] results['gaussians'][{idx}].opacities shape: {gs.opacities.shape}")
+    
+        # for idx, x in enumerate(results['gaussians_fused_features']):
+        #     print(f"[EncoderFreeSplat] results['gaussians_fused_features'][{idx}] shape: {x.shape}")
+      
+        # for idx, x in enumerate(results['gaussians_fused_weights']):
+        #     print(f"[EncoderFreeSplat] results['gaussians_fused_weights'][{idx}] shape: {x.shape}")
 
         return results
 
