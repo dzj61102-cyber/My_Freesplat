@@ -65,6 +65,8 @@ test:
   output_path: outputs/test
   save_ratio: 1.0
   pruning_mode: 0
+  save_context_change_maps: true
+  save_fused_change_histogram: true
 
 seed: 111123
 

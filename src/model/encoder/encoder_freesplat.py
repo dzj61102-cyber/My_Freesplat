@@ -8,6 +8,7 @@ import torch
 from einops import rearrange
 from jaxtyping import Float
 from torch import Tensor, nn
+import torch.nn.functional as F
 
 # 项目内：数据结构、几何工具、编码器组件
 from ...dataset.shims.patch_shim import apply_patch_shim
@@ -54,6 +55,7 @@ class BudgetPruningCfg:
     keep_ratio: float = 0.8
     lambda_budget: float = 0.2
     lambda_bin: float = 0.005
+    lambda_bce: float = 0.05
     tau_start: float = 0.5
     tau_end: float = 0.3
     total_steps: int = 300000
@@ -283,6 +285,122 @@ class EncoderFreeSplat(Encoder[EncoderFreeSplatCfg]):
         tau_start = max(cfg.tau_start, 1e-6)
         tau_end = max(cfg.tau_end, 1e-6)
         return tau_start * ((tau_end / tau_start) ** progress)
+
+    def _spatial_gradient_xy(self, x: Tensor) -> tuple[Tensor, Tensor]:
+        """计算保持原分辨率的 x/y 一阶差分梯度。"""
+        gx = torch.zeros_like(x)
+        gy = torch.zeros_like(x)
+        h, w = x.shape[-2], x.shape[-1]
+
+        if w > 1:
+            gx[..., :, 1:-1] = 0.5 * (x[..., :, 2:] - x[..., :, :-2])
+            gx[..., :, 0] = x[..., :, 1] - x[..., :, 0]
+            gx[..., :, -1] = x[..., :, -1] - x[..., :, -2]
+
+        if h > 1:
+            gy[..., 1:-1, :] = 0.5 * (x[..., 2:, :] - x[..., :-2, :])
+            gy[..., 0, :] = x[..., 1, :] - x[..., 0, :]
+            gy[..., -1, :] = x[..., -1, :] - x[..., -2, :]
+
+        return gx, gy
+
+    # def _points_to_normals(self, points_bvhw3: Tensor) -> Tensor:
+    #     """由邻点差分 + 叉乘得到法线图，输出 [B*V, 3, H, W]。"""
+    #     dx = torch.zeros_like(points_bvhw3)
+    #     dy = torch.zeros_like(points_bvhw3)
+    #     h, w = points_bvhw3.shape[1], points_bvhw3.shape[2]
+
+    #     if w > 1:
+    #         dx[:, :, 1:-1, :] = points_bvhw3[:, :, 2:, :] - points_bvhw3[:, :, :-2, :]
+    #         dx[:, :, 0, :] = points_bvhw3[:, :, 1, :] - points_bvhw3[:, :, 0, :]
+    #         dx[:, :, -1, :] = points_bvhw3[:, :, -1, :] - points_bvhw3[:, :, -2, :]
+
+    #     if h > 1:
+    #         dy[:, 1:-1, :, :] = points_bvhw3[:, 2:, :, :] - points_bvhw3[:, :-2, :, :]
+    #         dy[:, 0, :, :] = points_bvhw3[:, 1, :, :] - points_bvhw3[:, 0, :, :]
+    #         dy[:, -1, :, :] = points_bvhw3[:, -1, :, :] - points_bvhw3[:, -2, :, :]
+
+    #     normal = torch.cross(dx, dy, dim=-1)
+    #     normal = F.normalize(normal, dim=-1, eps=1e-6)
+    #     return normal.permute(0, 3, 1, 2).contiguous()
+
+    # def _compute_change_components(self, image_bv3hw: Tensor, points_bvhw3: Tensor) -> tuple[Tensor, Tensor]:
+    #     """计算光度变化与几何变化（实际值），各输出 [B*V, 1, H, W]。"""
+    #     # photometric variation
+    #     photo_dx, photo_dy = self._spatial_gradient_xy(image_bv3hw)
+    #     g_photo = torch.sqrt(
+    #         torch.sum(photo_dx * photo_dx, dim=1, keepdim=True)
+    #         + torch.sum(photo_dy * photo_dy, dim=1, keepdim=True)
+    #         + 1e-6
+    #     )
+
+        # geometric variation (points -> smooth -> normal -> normal gradient)
+        # points_smoothed = F.avg_pool2d(
+        #     points_bvhw3.permute(0, 3, 1, 2),
+        #     kernel_size=3,
+        #     stride=1,
+        #     padding=1,
+        # ).permute(0, 2, 3, 1).contiguous()
+        # normal = self._points_to_normals(points_bvhw3)
+        # 原有 g_geo 计算方法（保留，仅注释）：
+        # normal_dx, normal_dy = self._spatial_gradient_xy(normal)
+        # g_geo = torch.sqrt(
+        #     torch.sum(normal_dx * normal_dx, dim=1, keepdim=True)
+        #     + torch.sum(normal_dy * normal_dy, dim=1, keepdim=True)
+        #     + 1e-6
+        # )
+        # 新方法：中心法线与 8 邻域法线点积，按方向加权平均。
+        # 上下左右权重 1；对角线权重 1/sqrt(2)。
+        # normal_pad = F.pad(normal, (1, 1, 1, 1), mode="replicate")
+        # center = normal
+        # offsets = [
+        #     (-1, 0), (1, 0), (0, -1), (0, 1),
+        #     (-1, -1), (-1, 1), (1, -1), (1, 1),
+        # ]
+        # w_axis = 1.0
+        # w_diag = 1.0 / (2.0 ** 0.5)
+        # weights = [w_axis, w_axis, w_axis, w_axis, w_diag, w_diag, w_diag, w_diag]
+        # weight_sum = sum(weights)
+        # weighted_dot = 0.0
+        # h_n, w_n = center.shape[-2], center.shape[-1]
+        # for (dy, dx), w_dir in zip(offsets, weights):
+        #     neigh = normal_pad[:, :, 1 + dy:1 + dy + h_n, 1 + dx:1 + dx + w_n]
+        #     dot = torch.sum(center * neigh, dim=1, keepdim=True).clamp(-1.0, 1.0)
+        #     weighted_dot = weighted_dot + w_dir * dot
+        # avg_dot = weighted_dot / weight_sum
+        # # 点积越小，法线变化越大；因此用 1-avg_dot 作为几何变化值。
+        # g_geo = 1.0 - avg_dot
+
+        # # 边界修正：四周 10 像素用最近内部值填充。
+        # border = 10
+        # if g_geo.shape[-2] > (2 * border) and g_geo.shape[-1] > (2 * border):
+        #     g_geo[..., :border, :] = g_geo[..., border:border + 1, :]
+        #     g_geo[..., -border:, :] = g_geo[..., -border - 1:-border, :]
+        #     g_geo[..., :, :border] = g_geo[..., :, border:border + 1]
+        #     g_geo[..., :, -border:] = g_geo[..., :, -border - 1:-border]
+
+        # # 95 分位数剪裁：截断异常大几何变化值。
+        # g_geo_flat = g_geo.flatten(1)
+        # g_geo_q95 = torch.quantile(g_geo_flat, 0.95, dim=1, keepdim=True)
+        # g_geo = torch.minimum(g_geo_flat, g_geo_q95).view_as(g_geo)
+
+        # return g_photo, g_geo
+
+    # def _compute_change_map(self, image_bv3hw: Tensor, points_bvhw3: Tensor) -> Tensor:
+    #     """计算光度变化 + 几何变化（实际值），输出 [B*V, 1, H, W]。"""
+    #     g_photo, g_geo = self._compute_change_components(image_bv3hw, points_bvhw3)
+    #     g = 0.5 * (g_photo + g_geo)
+    #     return g
+
+    def _compute_change_map(self, image_bv3hw: Tensor) -> Tensor:
+        """计算光度变化 （实际值），输出 [B*V, 1, H, W]。"""
+        photo_dx, photo_dy = self._spatial_gradient_xy(image_bv3hw)
+        g_photo = torch.sqrt(
+            torch.sum(photo_dx * photo_dx, dim=1, keepdim=True)
+            + torch.sum(photo_dy * photo_dy, dim=1, keepdim=True)
+            + 1e-6
+        )
+        return g_photo
 
     def map_pdf_to_opacity(
         self,
@@ -518,7 +636,6 @@ class EncoderFreeSplat(Encoder[EncoderFreeSplatCfg]):
         #       - 含义：全分辨率的深度置信度（取深度候选 softmax 后的最大概率并上采样）
         #       - shape：[B*V, 1, H, W]
         depth_outputs = self.depth_decoder(cur_feats)
-        
         # 把 depth_outputs 拆成几何量（depth/weight/xy）+ 密度 + 外观特征，并全部变成逐像素 token 形式
 
         to_skip = context['image']
@@ -565,6 +682,16 @@ class EncoderFreeSplat(Encoder[EncoderFreeSplatCfg]):
                     (h, w),
                     fusion=True,
                 ))
+        # 变化图：直接复用已计算的像素对齐 3D 点 coords[0]，避免重复反投影。
+        image_bv3hw = rearrange(context["image"], "b v c h w -> (b v) c h w")
+        # points_bvhw3 = rearrange(coords[0][..., 0, 0, :], "b v (h w) c -> (b v) h w c", h=h, w=w)
+        local_change_map = self._compute_change_map(image_bv3hw)
+        # 原双变化值加权版本（保留，便于回退）：
+        # local_change_map = 0.5 * (g_photo_map + g_geo_map)
+        local_changes = rearrange(local_change_map, "(b v) c h w -> b v (h w) c ()", b=b, v=n_views)
+        results["context_change_map_bv1hw"] = rearrange(local_change_map, "(b v) c h w -> b v c h w", b=b, v=n_views)
+        # results["context_change_map_photo_bv1hw"] = rearrange(g_photo_map, "(b v) c h w -> b v c h w", b=b, v=n_views)
+        # results["context_change_map_geo_bv1hw"] = rearrange(g_geo_map, "(b v) c h w -> b v c h w", b=b, v=n_views)
         # 暂存每像素高斯特征，shape: [B, V,  H*W, 64],（来自深度解码器+skip特征）后续做跨视角融合
         gaussians.append(gaussians_feats)
 
@@ -607,6 +734,7 @@ class EncoderFreeSplat(Encoder[EncoderFreeSplatCfg]):
         our_gaussians = []#每个 batch 样本融合后的高斯结果
         fused_features = []#每个样本的全局融合特征（与最终高斯一一对应）
         fused_weights = []#每个样本的全局融合权重（与最终高斯一一对应）
+        fused_changes = []#每个样本的全局融合变化值（与最终高斯一一对应）
         num_raw_gaussians = gaussians[0].shape[2] * gaussians[0].shape[1]#融合前原始高斯数量V*H*W
         B = gaussians[0].shape[0]#B
         for b in range(B):
@@ -619,6 +747,8 @@ class EncoderFreeSplat(Encoder[EncoderFreeSplatCfg]):
             cur_densities = densities[b:b+1] #densities的shape:[B,V,H*W,1,1]
             # 深度权重[1,V,H*W,1,1]
             cur_weights = weights[b:b+1] #weights的shape:[B,V,H*W,1,1]
+            # 局部变化值 [1,V,H*W,1,1]
+            cur_changes = local_changes[b:b+1]
             # 全分辨率深度图[V,1,H,W]
             cur_depth = rearrange(depth_outputs[f'depth_pred_s-1_b1hw'], "(b v) c h w -> b v c h w", b=B)[b]#[B*V,1,H,W]->[B,V,1,H,W]
             
@@ -629,11 +759,13 @@ class EncoderFreeSplat(Encoder[EncoderFreeSplatCfg]):
                 cur_extrinsics,
                 cur_depths,
                 cur_fused_densities,
+                cur_fused_changes,
             ) = self.fuse_gaussians(
                 cur_gs,
                 cur_coords,
                 cur_densities,
                 cur_weights,
+                cur_changes,
                 cur_depth,
                 context["extrinsics"][b:b+1],
                 context["intrinsics"][b:b+1],
@@ -683,6 +815,7 @@ class EncoderFreeSplat(Encoder[EncoderFreeSplatCfg]):
             # 保留融合中间量，供后续按同索引访问每个全局高斯
             fused_features.append(cur_fused_features)
             fused_weights.append(cur_fused_densities)
+            fused_changes.append(cur_fused_changes)
             
         # 统计融合效果
         # 融合前后高斯数量和压缩率
@@ -731,10 +864,12 @@ class EncoderFreeSplat(Encoder[EncoderFreeSplatCfg]):
                 ),
             ))
         fused_weights_flat = [rearrange(x, "b g () () -> b g") for x in fused_weights]
+        fused_changes_flat = [rearrange(x, "b g () () -> b g") for x in fused_changes]
         results['gaussians'] = final_gs
         # 与 results['gaussians'] 同列表顺序、同高斯索引的一一对应附加属性
         results['gaussians_fused_features'] = fused_features
         results['gaussians_fused_weights'] = fused_weights_flat
+        results['gaussians_fused_changes'] = fused_changes_flat
         # - 对于每个样本 i，高斯索引 g 一一对应：
         # - results['gaussians'][i].means[:, g, ...] / covariances / harmonics / opacities
         # - results['gaussians_fused_features'][i][:, g, ...]
@@ -757,8 +892,9 @@ class EncoderFreeSplat(Encoder[EncoderFreeSplatCfg]):
             pruned_gaussians = []
             budget_terms = []
             bin_terms = []
+            bce_terms = []
             # gs原始标准高斯对象, feat高斯融合特征, weight高斯融合权重
-            for gs, feat, weight in zip(final_gs, fused_features, fused_weights_flat):
+            for gs, feat, weight, change in zip(final_gs, fused_features, fused_weights_flat, fused_changes_flat):
                 z = torch.cat(
                     [feat, torch.log1p(weight).unsqueeze(-1), gs.opacities.unsqueeze(-1)],
                     dim=-1,
@@ -776,8 +912,13 @@ class EncoderFreeSplat(Encoder[EncoderFreeSplatCfg]):
                             gs.opacities * gates,
                         )
                     )
+                    # teacher 采用排序名次映射：rank / (N-1), rank ∈ [0, N-1]
+                    ranks = torch.argsort(torch.argsort(change, dim=-1), dim=-1).to(change.dtype)
+                    denom = float(max(change.shape[-1] - 1, 1))
+                    teacher = ranks / denom
                     budget_terms.append((gates.mean() - cfg_prune.keep_ratio) ** 2)#预算损失，鼓励平均保留率接近目标 keep_ratio
                     bin_terms.append((gates * (1 - gates)).mean())#二值化正则项，鼓励 gate 接近 0 或 1
+                    bce_terms.append(F.binary_cross_entropy(gates.clamp(1e-6, 1 - 1e-6), teacher))
                 else:#测试直接硬剪枝,不改变高斯属性
                     pruned_gaussians.append(gs)
 
@@ -788,6 +929,7 @@ class EncoderFreeSplat(Encoder[EncoderFreeSplatCfg]):
                 results['gaussians_soft_gates'] = gates_per_sample
                 results['prune_budget_loss'] = cfg_prune.lambda_budget * torch.stack(budget_terms).mean()
                 results['prune_bin_loss'] = cfg_prune.lambda_bin * torch.stack(bin_terms).mean()
+                results['prune_bce_loss'] = cfg_prune.lambda_bce * torch.stack(bce_terms).mean()
                 # 软门控的平均激活率，可理解为当前实际保留比例（soft）
                 results['prune_gate_ratio'] = torch.stack([x.mean() for x in gates_per_sample]).mean()
                 results['prune_tau'] = torch.tensor(
@@ -812,7 +954,7 @@ class EncoderFreeSplat(Encoder[EncoderFreeSplatCfg]):
 
         return results
 
-    def fuse_gaussians(self, gaussians, coords, densities, weight_emb, depths, 
+    def fuse_gaussians(self, gaussians, coords, densities, weight_emb, local_changes, depths, 
                        extrinsics, intrinsics, image_shape, depth_thres=0.1):
         """融合多视角高斯点，减少重复并整合属性。
 
@@ -831,6 +973,7 @@ class EncoderFreeSplat(Encoder[EncoderFreeSplatCfg]):
         global_gaussians = gaussians[0][:,0]#[1,HW,64]
         global_densities = densities[:, 0]
         global_weight_emb = weight_emb[:, 0]
+        global_changes = local_changes[:, 0]
         global_coords = coords[0][:,0,:,0,0]
         # 每个高斯关联一个“来源外参”，后续融合时做加权更新，用第 0 个视角的外参初始化
         global_extrinsics = extrinsics[:,0][:,None].repeat(1,global_gaussians.shape[1],1,1)#[1, HW, 4, 4]
@@ -928,10 +1071,24 @@ class EncoderFreeSplat(Encoder[EncoderFreeSplatCfg]):
                 # 位置、密度（权重）、深度置信度、外参、深度做加权融合，(旧值 * 旧权重 + 新值 * 新权重) / (旧权重 + 新权重)
                 global_coords = torch.cat([global_coords[:, ~mask], (global_coords[:, mask]*weights_0[...,1] +
                                                 coords[0][:, i, pixel_indices][:,fusion_indices_,0,0]*weights_1[...,1]) / (weights_0[...,1]+weights_1[...,1])], dim=1)
+
+                den_old = global_densities[:, mask]
+                den_cur = densities[:, i, pixel_indices][:,fusion_indices_]
+                change_old = global_changes[:, mask]
+                change_cur = local_changes[:, i, pixel_indices][:,fusion_indices_]
+                fused_change = (den_old * change_old + den_cur * change_cur) / (den_old + den_cur + 1e-6)
+
                 global_densities = torch.cat([global_densities[:, ~mask], (global_densities[:, mask] +
                                                         densities[:, i, pixel_indices][:,fusion_indices_])], dim=1)
                 global_weight_emb = torch.cat([global_weight_emb[:, ~mask], (global_weight_emb[:, mask] +
                                                         weight_emb[:, i, pixel_indices][:,fusion_indices_])], dim=1)
+                global_changes = torch.cat(
+                    [
+                        global_changes[:, ~mask],
+                        fused_change,
+                    ],
+                    dim=1,
+                )
                 
                 global_extrinsics = torch.cat([global_extrinsics[:, ~mask], (global_extrinsics[:, mask]*weights_0[...,:1] +
                                                 extrinsics[:, i, None]*weights_1[...,:1]) / (weights_0[...,:1]+weights_1[...,:1])], dim=1)
@@ -949,9 +1106,10 @@ class EncoderFreeSplat(Encoder[EncoderFreeSplatCfg]):
                                                 [:,~fusion_mask]], dim=1)
             global_weight_emb = torch.cat([global_weight_emb, weight_emb[:,i]\
                                                 [:,~fusion_mask]], dim=1)
+            global_changes = torch.cat([global_changes, local_changes[:, i][:, ~fusion_mask]], dim=1)
             global_extrinsics = torch.cat([global_extrinsics, extrinsics[:,i,None].repeat(1,(~fusion_mask).sum(),1,1)], dim=1)
             global_depths = torch.cat([global_depths, depths[None,i]\
                                                 [:,~fusion_mask]], dim=1)
 
         # 返回融合后的特征、坐标、外参、深度和融合权重
-        return global_gaussians, global_coords, global_extrinsics, global_depths, global_densities
+        return global_gaussians, global_coords, global_extrinsics, global_depths, global_densities, global_changes

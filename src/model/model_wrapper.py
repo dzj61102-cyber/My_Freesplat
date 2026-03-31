@@ -85,6 +85,50 @@ def convert_array_to_pil(depth_map, no_text=False):
 
     return colormapped_im
 
+
+def convert_scalar_map_to_pil(value_map, no_text=False, cmap="magma"):
+    value_map = np.asarray(value_map)
+    if value_map.ndim == 3 and value_map.shape[0] == 1:
+        value_map = value_map[0]
+    elif value_map.ndim == 3 and value_map.shape[-1] == 1:
+        value_map = value_map[..., 0]
+    elif value_map.ndim != 2:
+        raise ValueError(f"Expected scalar map with 2 dims, got shape {value_map.shape}")
+
+    mask = np.isfinite(value_map)
+    if not np.any(mask):
+        return np.full((*value_map.shape, 3), 255, dtype=np.uint8)
+
+    vmin = np.percentile(value_map[mask], 5)
+    vmax = np.percentile(value_map[mask], 95)
+    if vmax <= vmin:
+        vmax = vmin + 1e-6
+
+    normalizer = mpl.colors.Normalize(vmin=vmin, vmax=vmax)
+    cmap_obj = plt.get_cmap(cmap)
+    masked_map = np.ma.array(value_map, mask=~mask)
+
+    h, w = value_map.shape
+    fig_w = max(4.0, w / 160.0)
+    fig_h = max(3.0, h / 160.0)
+    fig, ax = plt.subplots(figsize=(fig_w, fig_h), dpi=150)
+    im = ax.imshow(masked_map, cmap=cmap_obj, norm=normalizer)
+    ax.set_axis_off()
+    cbar = fig.colorbar(im, ax=ax, fraction=0.046, pad=0.02)
+    cbar.ax.tick_params(labelsize=8)
+    cbar.set_label("Change Value", fontsize=9)
+    if not no_text:
+        ax.set_title(
+            f"min={float(value_map[mask].min()):.4f}, max={float(value_map[mask].max()):.4f}",
+            fontsize=10,
+        )
+    fig.tight_layout(pad=0.1)
+    fig.canvas.draw()
+    rgba = np.asarray(fig.canvas.buffer_rgba())
+    rgb = rgba[..., :3].copy()
+    plt.close(fig)
+    return rgb
+
 # Compute RGB metrics at novel views.
 def compute_metrics(rgb_gt, rgb):
     rgb = rgb.clip(min=0, max=1)
@@ -261,6 +305,85 @@ def save_gaussian_metric_visualizations(
     cbar.set_label(metric_name)
     fig.tight_layout()
     fig.savefig(scene_dir / f"gaussian_{metric_prefix}_3d{suffix}.png", dpi=260)
+    plt.close(fig)
+
+
+def save_fused_change_histogram(
+    fused_changes,
+    output_root: Path,
+    scene: str,
+    sample_idx: int = 0,
+):
+    if fused_changes is None:
+        return
+    if isinstance(fused_changes, list):
+        if len(fused_changes) == 0:
+            return
+        if sample_idx >= len(fused_changes):
+            return
+        fused_changes = fused_changes[sample_idx]
+
+    if not torch.is_tensor(fused_changes):
+        return
+    if fused_changes.ndim == 2:
+        # [B, G] -> [G]
+        fused_changes = fused_changes[0]
+
+    values = fused_changes.detach().float().cpu()
+    values = values[torch.isfinite(values)]
+    if values.numel() == 0:
+        return
+
+    scene_dir = output_root / scene / "fused_change_hist"
+    scene_dir.mkdir(parents=True, exist_ok=True)
+
+    values_np = values.numpy()
+    fig, ax = plt.subplots(figsize=(8, 5))
+    ax.hist(values_np, bins=100, color="#22C55E", edgecolor="black", linewidth=0.2)
+    ax.set_title(f"Fused Global Change Histogram ({scene})")
+    ax.set_xlabel("Fused Change Value")
+    ax.set_ylabel("Count")
+    fig.tight_layout()
+    fig.savefig(scene_dir / f"sample_{sample_idx:0>3}.png", dpi=220)
+    plt.close(fig)
+
+
+def save_teacher_histogram(
+    teacher_values,
+    output_root: Path,
+    scene: str,
+    sample_idx: int = 0,
+):
+    if teacher_values is None:
+        return
+    if isinstance(teacher_values, list):
+        if len(teacher_values) == 0:
+            return
+        if sample_idx >= len(teacher_values):
+            return
+        teacher_values = teacher_values[sample_idx]
+
+    if not torch.is_tensor(teacher_values):
+        return
+    if teacher_values.ndim == 2:
+        teacher_values = teacher_values[0]
+
+    values = teacher_values.detach().float().cpu()
+    values = values[torch.isfinite(values)]
+    if values.numel() == 0:
+        return
+
+    scene_dir = output_root / scene / "teacher_hist"
+    scene_dir.mkdir(parents=True, exist_ok=True)
+
+    values_np = values.numpy()
+    fig, ax = plt.subplots(figsize=(8, 5))
+    ax.hist(values_np, bins=100, color="#F97316", edgecolor="black", linewidth=0.2)
+    ax.set_title(f"Teacher Histogram ({scene})")
+    ax.set_xlabel("Teacher Value")
+    ax.set_ylabel("Count")
+    fig.tight_layout()
+    fig.savefig(scene_dir / f"sample_{sample_idx:0>3}.png", dpi=220)
     plt.close(fig)
 
 # 获取剪枝分数，输入的importance_scores是学习所得分数
@@ -484,6 +607,10 @@ class TestCfg:
     # 剪枝模式：
     # 0=不剪枝，1=opacity，2=opacity*scale_proxy，3=learned importance score。
     pruning_mode: int = 0
+    # 是否在测试时保存每个输入视角的变化值图。
+    save_context_change_maps: bool = True
+    # 是否在测试时保存融合后全局高斯变化值直方图。
+    save_fused_change_histogram: bool = True
 
 
 @dataclass
@@ -692,12 +819,19 @@ class ModelWrapper(LightningModule):
             prune_bin_loss = encoder_results["prune_bin_loss"]
             # 总损失 = 主渲染损失 + 剪枝正则项。
             total_loss = total_loss + prune_budget_loss + prune_bin_loss
+            if "prune_bce_loss" in encoder_results:
+                total_loss = total_loss + encoder_results["prune_bce_loss"]
             self.log("loss/prune_budget", prune_budget_loss, on_step=True, on_epoch=True, sync_dist=True, logger=True)
             self.log("loss/prune_bin", prune_bin_loss, on_step=True, on_epoch=True, sync_dist=True, logger=True)
+            if "prune_bce_loss" in encoder_results:
+                self.log("loss/prune_bce", encoder_results["prune_bce_loss"], on_step=True, on_epoch=True, sync_dist=True, logger=True)
             self.losses_log["prune_budget"] = self.losses_log.get("prune_budget", [])
             self.losses_log["prune_budget"].append(prune_budget_loss)
             self.losses_log["prune_bin"] = self.losses_log.get("prune_bin", [])
             self.losses_log["prune_bin"].append(prune_bin_loss)
+            if "prune_bce_loss" in encoder_results:
+                self.losses_log["prune_bce"] = self.losses_log.get("prune_bce", [])
+                self.losses_log["prune_bce"].append(encoder_results["prune_bce_loss"])
             if "prune_gate_ratio" in encoder_results:
                 # gate 平均激活率（可与 keep_ratio 对比观察预算约束是否生效）。
                 self.log("prune/gate_ratio", encoder_results["prune_gate_ratio"], on_step=True, on_epoch=True, sync_dist=True, logger=True)
@@ -888,6 +1022,34 @@ class ModelWrapper(LightningModule):
             pruning_mode=self.test_cfg.pruning_mode,
             suffix="_pruned",
         )
+        if self.test_cfg.save_fused_change_histogram:
+            fused_changes = encoder_results.get("gaussians_fused_changes", None)
+            if isinstance(fused_changes, list):
+                for sample_idx in range(len(fused_changes)):
+                    save_fused_change_histogram(
+                        fused_changes,
+                        path,
+                        scene,
+                        sample_idx=sample_idx,
+                    )
+                    change_i = fused_changes[sample_idx]
+                    if torch.is_tensor(change_i):
+                        ranks = torch.argsort(torch.argsort(change_i, dim=-1), dim=-1).to(change_i.dtype)
+                        denom = float(max(change_i.shape[-1] - 1, 1))
+                        teacher_i = ranks / denom
+                        save_teacher_histogram(
+                            teacher_i,
+                            path,
+                            scene,
+                            sample_idx=sample_idx,
+                        )
+            else:
+                save_fused_change_histogram(fused_changes, path, scene, sample_idx=0)
+                if torch.is_tensor(fused_changes):
+                    ranks = torch.argsort(torch.argsort(fused_changes, dim=-1), dim=-1).to(fused_changes.dtype)
+                    denom = float(max(fused_changes.shape[-1] - 1, 1))
+                    teacher = ranks / denom
+                    save_teacher_histogram(teacher, path, scene, sample_idx=0)
         abs_diff, rel_diff, delta_25, delta_10 = depth_render_metrics(output, batch)
         print(f'abs_diff: {abs_diff}, rel_diff: {rel_diff}, delta_25: {delta_25}, delta_10: {delta_10}')
         self.benchmarker.store('depth_abs_diff', float(abs_diff.detach().cpu().numpy()))
@@ -906,6 +1068,24 @@ class ModelWrapper(LightningModule):
         for i, index, fig in zip(range(len(batch["context"]["index"][0])), batch["context"]["index"][0], batch["context"]["image"][0]):
             length = len(encoder_results[f"depth_num0_s-1"][0])
             save_image(fig, path / scene / f"contexts/{index:0>6}.png")
+            if self.test_cfg.save_context_change_maps and "context_change_map_bv1hw" in encoder_results:
+                change_map = encoder_results["context_change_map_bv1hw"][0, i].cpu().numpy()
+                save_image(
+                    torch.from_numpy(convert_scalar_map_to_pil(change_map, no_text=True).transpose(2, 0, 1).astype(np.float32) / 255).to(batch["context"]["image"][0].device),
+                    path / scene / f"change_map/{index:0>6}.png",
+                )
+            # if self.test_cfg.save_context_change_maps and "context_change_map_photo_bv1hw" in encoder_results:
+            #     change_map_photo = encoder_results["context_change_map_photo_bv1hw"][0, i].cpu().numpy()
+            #     save_image(
+            #         torch.from_numpy(convert_scalar_map_to_pil(change_map_photo, no_text=True).transpose(2, 0, 1).astype(np.float32) / 255).to(batch["context"]["image"][0].device),
+            #         path / scene / f"change_map_photo/{index:0>6}.png",
+            #     )
+            # if self.test_cfg.save_context_change_maps and "context_change_map_geo_bv1hw" in encoder_results:
+            #     change_map_geo = encoder_results["context_change_map_geo_bv1hw"][0, i].cpu().numpy()
+            #     save_image(
+            #         torch.from_numpy(convert_scalar_map_to_pil(change_map_geo, no_text=True).transpose(2, 0, 1).astype(np.float32) / 255).to(batch["context"]["image"][0].device),
+            #         path / scene / f"change_map_geo/{index:0>6}.png",
+            #     )
             save_image(torch.from_numpy(convert_array_to_pil(encoder_results[f"depth_num0_s-1"][0][i].cpu().numpy().reshape(h,w), no_text=True).transpose(2,0,1)\
                                         .astype(np.float32)/255).to(batch["context"]["image"][0].device),
                                         path / scene / f"depth_pred/{index:0>6}.png")
