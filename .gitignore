@@ -2,3 +2,4 @@ outputs/
 ckpoints/
 __pycache__/
 datasets/
+.ipynb_checkpoints/

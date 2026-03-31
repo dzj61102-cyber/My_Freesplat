@@ -40,6 +40,11 @@ optimizer:
   lr: 1.e-4
   warm_up_steps: 100
   cosine_lr: true
+  lr_importance_head: 1.e-4
+  lr_gru: 5.e-5
+  lr_to_gaussians: 5.e-5
+  lr_depth_decoder: 2.e-5
+  lr_high_resolution_skip0: 2.e-5
 
 checkpointing:
   load: null

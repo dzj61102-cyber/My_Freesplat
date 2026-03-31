@@ -195,6 +195,23 @@ def save_gaussian_metric_visualizations(
     metric_np = metric_values.numpy()
     fig, ax = plt.subplots(figsize=(8, 5))
     ax.hist(metric_np, bins=100, color="#3B82F6", edgecolor="black", linewidth=0.2)
+    if suffix == "":
+        top_levels = [0.8, 0.6, 0.4]
+        quantile_colors = ["#EF4444", "#F59E0B", "#10B981"]
+        ymax = ax.get_ylim()[1]
+        for top_p, c in zip(top_levels, quantile_colors):
+            qv = float(np.quantile(metric_np, 1.0 - top_p))
+            ax.axvline(qv, color=c, linestyle="--", linewidth=1.5, alpha=0.95)
+            ax.text(
+                qv,
+                ymax * 0.98,
+                f"Top{int(top_p * 100)}%={qv:.4f}",
+                color=c,
+                rotation=90,
+                va="top",
+                ha="right",
+                fontsize=8,
+            )
     ax.set_title(f"Global Gaussian {metric_name} Histogram ({scene}){title_suffix}")
     ax.set_xlabel(metric_name)
     fig.tight_layout()
@@ -209,6 +226,19 @@ def save_gaussian_metric_visualizations(
 
     xyz = means.numpy()
     metric_np = metric_values.numpy()
+    high_contrast_cmap = mpl.colors.LinearSegmentedColormap.from_list(
+        "high_contrast_no_yellow",
+        [
+            "#0B1F8A",  # deep blue
+            "#1D4ED8",  # blue
+            "#06B6D4",  # cyan
+            "#10B981",  # green
+            "#F97316",  # orange
+            "#DC2626",  # red
+            "#7F1D1D",  # dark red
+        ],
+        N=256,
+    )
     fig = plt.figure(figsize=(9, 7))
     ax = fig.add_subplot(111, projection="3d")
     scatter = ax.scatter(
@@ -216,7 +246,7 @@ def save_gaussian_metric_visualizations(
         xyz[:, 1],
         xyz[:, 2],
         c=metric_np,
-        cmap="viridis",
+        cmap=high_contrast_cmap,
         s=1.2,
         alpha=0.9,
         vmin=color_min,
@@ -316,6 +346,95 @@ def prune_gaussians_container(
     return prune_gaussians(gaussians, save_ratio, pruning_mode, importance_scores)
 
 
+def prune_gaussians_mode3_with_gated_opacity(
+    gaussians,
+    save_ratio: float,
+    importance_scores,
+    tau: float = 0.2,
+):
+    # mode=3 测试/验证路径：
+    # 1) m = sigmoid(s / tau)
+    # 2) new_opacity = old_opacity * m
+    # 3) 按 new_opacity 做 top-k(keep_ratio) 剪枝
+    # 4) 用 new_opacity 渲染
+    if importance_scores is None:
+        raise ValueError("importance_scores is required for mode=3 gated pruning")
+
+    tau = max(float(tau), 1e-6)
+
+    def _prune_one(gs: Gaussians, score: Tensor) -> Gaussians:
+        if score.ndim == 1:
+            score = score.unsqueeze(0)
+        if score.ndim != 2:
+            raise ValueError(
+                f"importance score must be 2D [B, G] or 1D [G], got shape {tuple(score.shape)}"
+            )
+
+        if score.shape[-1] != gs.opacities.shape[-1]:
+            raise ValueError(
+                "importance score and gaussian opacities mismatch: "
+                f"{tuple(score.shape)} vs {tuple(gs.opacities.shape)}"
+            )
+        if score.shape[0] != gs.opacities.shape[0]:
+            if score.shape[0] == 1:
+                score = score.expand(gs.opacities.shape[0], -1)
+            else:
+                raise ValueError(
+                    "importance score batch mismatch: "
+                    f"{tuple(score.shape)} vs {tuple(gs.opacities.shape)}"
+                )
+
+        gates = torch.sigmoid(score / tau).to(dtype=gs.opacities.dtype)
+        gated_gaussians = Gaussians(
+            gs.means,
+            gs.covariances,
+            gs.harmonics,
+            gs.opacities * gates,
+        )
+        return prune_gaussians(
+            gated_gaussians,
+            save_ratio=save_ratio,
+            pruning_mode=1,
+            importance_scores=None,
+        )
+
+    if isinstance(gaussians, list):
+        if isinstance(importance_scores, list):
+            score_list = importance_scores
+        elif torch.is_tensor(importance_scores) and importance_scores.ndim >= 2:
+            if importance_scores.shape[0] != len(gaussians):
+                raise ValueError(
+                    "importance_scores batch size does not match gaussians list length: "
+                    f"{importance_scores.shape[0]} vs {len(gaussians)}"
+                )
+            score_list = [importance_scores[i] for i in range(len(gaussians))]
+        else:
+            raise ValueError("importance_scores format is invalid for gaussians list")
+
+        if len(score_list) != len(gaussians):
+            raise ValueError(
+                f"importance_scores list length mismatch: {len(score_list)} vs {len(gaussians)}"
+            )
+        return [_prune_one(gs, score_list[i]) for i, gs in enumerate(gaussians)]
+
+    if isinstance(importance_scores, list):
+        if len(importance_scores) == 0:
+            raise ValueError("importance_scores list is empty")
+        importance_scores = importance_scores[0]
+    if not torch.is_tensor(importance_scores):
+        raise ValueError("importance_scores must be a Tensor for single Gaussians input")
+    return _prune_one(gaussians, importance_scores)
+
+
+def get_pruning_tau_end(encoder: nn.Module) -> float:
+    budget_cfg = getattr(getattr(encoder, "cfg", None), "budget_pruning", None)
+    if budget_cfg is None or not hasattr(budget_cfg, "tau_end"):
+        raise ValueError(
+            "Missing encoder.cfg.budget_pruning.tau_end for mode=3 inference pruning."
+        )
+    return float(budget_cfg.tau_end)
+
+
 def count_gaussians(gaussians) -> int:
     if isinstance(gaussians, list):
         return sum(int(gs.means.shape[1]) for gs in gaussians)
@@ -350,6 +469,11 @@ class OptimizerCfg:
     lr: float
     warm_up_steps: int
     cosine_lr: bool
+    lr_importance_head: float | None = None
+    lr_gru: float | None = None
+    lr_to_gaussians: float | None = None
+    lr_depth_decoder: float | None = None
+    lr_high_resolution_skip0: float | None = None
 
 
 @dataclass
@@ -430,17 +554,31 @@ class ModelWrapper(LightningModule):
         self.benchmarker = Benchmarker()
 
         self.losses_log = {}
-        # 先全冻结，再仅解冻 self.encoder.importance_head
+        # 先全冻结，再仅解冻白名单模块（兼容 train_only_importance_head 旧开关名）
         if self.train_cfg.train_only_importance_head:
             for param in self.parameters():
                 param.requires_grad = False
-            importance_head = getattr(self.encoder, "importance_head", None)
-            if importance_head is None:
+            modules_to_unfreeze: list[tuple[str, nn.Module | None]] = [
+                ("importance_head", getattr(self.encoder, "importance_head", None)),
+                ("gru", getattr(self.encoder, "gru", None)),
+                ("to_gaussians", getattr(self.encoder, "to_gaussians", None)),
+                ("depth_decoder", getattr(self.encoder, "depth_decoder", None)),
+            ]
+            high_resolution_skip = getattr(self.encoder, "high_resolution_skip", None)
+            if high_resolution_skip is not None and len(high_resolution_skip) > 0:
+                modules_to_unfreeze.append(("high_resolution_skip.0", high_resolution_skip[0]))
+            else:
+                modules_to_unfreeze.append(("high_resolution_skip.0", None))
+
+            missing_modules = [name for name, module in modules_to_unfreeze if module is None]
+            if missing_modules:
                 raise ValueError(
-                    "train.train_only_importance_head=true but encoder has no importance_head."
+                    "train.train_only_importance_head=true but encoder missing module(s): "
+                    + ", ".join(missing_modules)
                 )
-            for param in importance_head.parameters():
-                param.requires_grad = True
+            for _, module in modules_to_unfreeze:
+                for param in module.parameters():
+                    param.requires_grad = True
             # 打印可训练参数名预览   
             trainable_names = [
                 name for name, param in self.named_parameters() if param.requires_grad
@@ -581,17 +719,31 @@ class ModelWrapper(LightningModule):
             if 'gs_ratio' in encoder_results:
                 to_print = to_print + f' gs_ratio = {torch.mean(torch.tensor(encoder_results["gs_ratio"])):.6f}'
             print(to_print)
-            # 训练循环中的梯度范数检查，特别关注 importance_head 和一个冻结参数的梯度。
+            # 训练循环中的梯度范数检查，关注解冻白名单模块和一个冻结参数的梯度。
             if self.train_cfg.train_only_importance_head:
-                grad_head = None
-                if hasattr(self.encoder, "importance_head"):
-                    head_grads = [
+                grad_stats = {}
+                module_refs: list[tuple[str, nn.Module | None]] = [
+                    ("importance_head", getattr(self.encoder, "importance_head", None)),
+                    ("gru", getattr(self.encoder, "gru", None)),
+                    ("to_gaussians", getattr(self.encoder, "to_gaussians", None)),
+                    ("depth_decoder", getattr(self.encoder, "depth_decoder", None)),
+                ]
+                high_resolution_skip = getattr(self.encoder, "high_resolution_skip", None)
+                module_refs.append(
+                    ("high_resolution_skip.0", high_resolution_skip[0] if high_resolution_skip is not None and len(high_resolution_skip) > 0 else None)
+                )
+                for module_name, module in module_refs:
+                    if module is None:
+                        grad_stats[module_name] = -1.0
+                        continue
+                    module_grads = [
                         p.grad.detach().norm()
-                        for p in self.encoder.importance_head.parameters()
+                        for p in module.parameters()
                         if p.grad is not None
                     ]
-                    if len(head_grads) > 0:
-                        grad_head = torch.stack(head_grads).mean().item()
+                    grad_stats[module_name] = (
+                        torch.stack(module_grads).mean().item() if len(module_grads) > 0 else -1.0
+                    )
 
                 grad_frozen_example = None
                 for name, param in self.named_parameters():
@@ -607,7 +759,11 @@ class ModelWrapper(LightningModule):
                     grad_frozen_example = -1.0
                 print(
                     f"[FreezeCheck] step={self.global_step} "
-                    f"grad_importance_head_mean={grad_head if grad_head is not None else -1.0:.6e} "
+                    f"grad_importance_head_mean={grad_stats['importance_head']:.6e} "
+                    f"grad_gru_mean={grad_stats['gru']:.6e} "
+                    f"grad_to_gaussians_mean={grad_stats['to_gaussians']:.6e} "
+                    f"grad_depth_decoder_mean={grad_stats['depth_decoder']:.6e} "
+                    f"grad_high_resolution_skip0_mean={grad_stats['high_resolution_skip.0']:.6e} "
                     f"frozen_example={frozen_name} "
                     f"grad_norm={grad_frozen_example:.6e}"
                 )
@@ -639,7 +795,7 @@ class ModelWrapper(LightningModule):
         if batch_idx % 100 == 0:
             print(f"Test step {batch_idx:0>6}.")
     
-        # Render Gaussians.
+        # Render Gaussians.计算编码时间
         with self.benchmarker.time("encoder"):
             encoder_results = self.encoder(
                 batch["context"],
@@ -658,12 +814,14 @@ class ModelWrapper(LightningModule):
                 keep_ratio = self.test_cfg.save_ratio
                 if keep_ratio >= 1.0 and "prune_keep_ratio" in encoder_results:
                     keep_ratio = float(encoder_results["prune_keep_ratio"])
-                # 基于 learned score 执行 hard top-k。
-                gaussians = prune_gaussians_container(
+                # 采用训练最小温度 tau_end 做门控：m=sigmoid(s/tau_end)。
+                # 然后以 new_opacity=opacity*m 做 top-k，并以 new_opacity 渲染。
+                tau_end = get_pruning_tau_end(self.encoder)
+                gaussians = prune_gaussians_mode3_with_gated_opacity(
                     gaussians_full,
                     keep_ratio,
-                    self.test_cfg.pruning_mode,
                     importance_scores=importance_scores,
+                    tau=tau_end,
                 )
             else:
                 # mode=1/2：启发式剪枝路径。
@@ -671,7 +829,7 @@ class ModelWrapper(LightningModule):
                     gaussians_full, self.test_cfg.save_ratio, self.test_cfg.pruning_mode
                 )
             rendered_num_gaussians = count_gaussians(gaussians)
-            
+        # 计算解码时间
         with self.benchmarker.time("decoder", num_calls=v):
             if not isinstance(gaussians, list):
                 output = self.decoder.forward(
@@ -857,14 +1015,19 @@ class ModelWrapper(LightningModule):
         depth_delta_10_avg = torch.nanmean(torch.tensor(self.benchmarker.benchmarks['depth_delta_10'])).cpu().numpy()
         mean_encoder_time = np.mean(self.benchmarker.execution_times["encoder"]) if len(self.benchmarker.execution_times["encoder"]) > 0 else float("nan")
         mean_decoder_time = np.mean(self.benchmarker.execution_times["decoder"]) if len(self.benchmarker.execution_times["decoder"]) > 0 else float("nan")
+        mean_encode_decode_total_time = (
+            mean_encoder_time + mean_decoder_time
+            if np.isfinite(mean_encoder_time) and np.isfinite(mean_decoder_time)
+            else float("nan")
+        )
         fps = (1.0 / mean_decoder_time) if np.isfinite(mean_decoder_time) and mean_decoder_time > 0 else float("nan")
         peak_memory_bytes = torch.cuda.memory_stats()["allocated_bytes.all.peak"] if torch.cuda.is_available() else 0.0
         peak_memory_gb = peak_memory_bytes / (1024 ** 3)
         summary_metrics = {}
-        def log_metric(key, value):
+        def log_metric(key, value, digits=3):
             value = float(value)
-            print(f'{key}: {value:.3f}')
-            summary_metrics[key] = f"{value:.3f}"
+            print(f"{key}: {value:.{digits}f}")
+            summary_metrics[key] = f"{value:.{digits}f}"
 
         log_metric('psnr_inter_avg', psnr_inter_avg)
         log_metric('ssim_inter_avg', ssim_inter_avg)
@@ -890,7 +1053,9 @@ class ModelWrapper(LightningModule):
         log_metric('num_gaussians_avg', self.benchmarker.benchmarks["num_gaussians_avg"])
         log_metric('rendered_num_gaussians_avg', rendered_num_gaussians_avg)
         log_metric('peak_memory_gb', peak_memory_gb)
-        log_metric('mean_encoder_time', mean_encoder_time)
+        log_metric('mean_encoder_time', mean_encoder_time, digits=6)
+        log_metric('mean_decoder_time', mean_decoder_time, digits=6)
+        log_metric('mean_encode_decode_total_time', mean_encode_decode_total_time, digits=6)
         log_metric('fps', fps)
         summary_metrics_path = self.test_cfg.output_path / "terminal_metrics.json"
         summary_metrics_path.parent.mkdir(parents=True, exist_ok=True)
@@ -902,6 +1067,10 @@ class ModelWrapper(LightningModule):
     @rank_zero_only
     def validation_step(self, batch, batch_idx):# 训练中的验证
         batch: BatchedExample = self.data_shim(batch)
+        if not (0.0 < self.test_cfg.save_ratio <= 1.0):
+            raise ValueError(
+                f"test.save_ratio must be in (0, 1], got {self.test_cfg.save_ratio}"
+            )
         context_indices = batch['context']['index'].tolist()
 
         (scene,) = batch["scene"]
@@ -921,23 +1090,18 @@ class ModelWrapper(LightningModule):
             is_testing=True,
         )
         gaussians_probabilistic_full = encoder_probabilistic_results['gaussians']
-        # 验证阶段强制使用与测试 mode=3 一致的 hard 剪枝：
-        # 1) 分数来源：encoder 输出的 learned importance_scores
-        # 2) 保留比例：训练配置 keep_ratio（由 encoder 返回 prune_keep_ratio）
+
+        # 验证阶段默认固定 mode=3，并与 test_step 的 mode=3 路径保持一致。
         importance_scores = encoder_probabilistic_results.get("gaussians_importance_scores", None)
-        keep_ratio = float(
-            encoder_probabilistic_results.get(
-                "prune_keep_ratio",
-                getattr(getattr(self.encoder, "cfg", None), "budget_pruning", None).keep_ratio
-                if getattr(getattr(self.encoder, "cfg", None), "budget_pruning", None) is not None
-                else 0.8,
-            )
-        )
-        gaussians_probabilistic = prune_gaussians_container(
+        keep_ratio = self.test_cfg.save_ratio
+        if keep_ratio >= 1.0 and "prune_keep_ratio" in encoder_probabilistic_results:
+            keep_ratio = float(encoder_probabilistic_results["prune_keep_ratio"])
+        tau_end = get_pruning_tau_end(self.encoder)
+        gaussians_probabilistic = prune_gaussians_mode3_with_gated_opacity(
             gaussians_probabilistic_full,
             keep_ratio,
-            pruning_mode=3,
             importance_scores=importance_scores,
+            tau=tau_end,
         )
         if not isinstance(gaussians_probabilistic, list):
             output_probabilistic = self.decoder.forward(
@@ -1235,17 +1399,69 @@ class ModelWrapper(LightningModule):
                 )
     # 仅收集 requires_grad=True 参数，并打印可训练参数量
     def configure_optimizers(self):
-        trainable_params = [p for p in self.parameters() if p.requires_grad]
-        if len(trainable_params) == 0:
+        param_groups = []
+        if self.train_cfg.train_only_importance_head:
+            module_defs: list[tuple[str, nn.Module | None, float | None]] = [
+                ("importance_head", getattr(self.encoder, "importance_head", None), self.optimizer_cfg.lr_importance_head),
+                ("gru", getattr(self.encoder, "gru", None), self.optimizer_cfg.lr_gru),
+                ("to_gaussians", getattr(self.encoder, "to_gaussians", None), self.optimizer_cfg.lr_to_gaussians),
+                ("depth_decoder", getattr(self.encoder, "depth_decoder", None), self.optimizer_cfg.lr_depth_decoder),
+            ]
+            high_resolution_skip = getattr(self.encoder, "high_resolution_skip", None)
+            module_defs.append(
+                (
+                    "high_resolution_skip.0",
+                    high_resolution_skip[0] if high_resolution_skip is not None and len(high_resolution_skip) > 0 else None,
+                    self.optimizer_cfg.lr_high_resolution_skip0,
+                )
+            )
+
+            seen_param_ids: set[int] = set()
+            for module_name, module, module_lr in module_defs:
+                if module is None:
+                    continue
+                params = [p for p in module.parameters() if p.requires_grad and id(p) not in seen_param_ids]
+                if len(params) == 0:
+                    continue
+                for p in params:
+                    seen_param_ids.add(id(p))
+                lr_value = float(self.optimizer_cfg.lr if module_lr is None else module_lr)
+                param_groups.append(
+                    {
+                        "name": module_name,
+                        "params": params,
+                        "lr": lr_value,
+                    }
+                )
+        else:
+            trainable_params = [p for p in self.parameters() if p.requires_grad]
+            if len(trainable_params) > 0:
+                param_groups.append(
+                    {
+                        "name": "default",
+                        "params": trainable_params,
+                        "lr": float(self.optimizer_cfg.lr),
+                    }
+                )
+
+        if len(param_groups) == 0:
             raise ValueError("No trainable parameters found for optimizer.")
-        self.trainable_param_count = sum(p.numel() for p in trainable_params)
+        self.trainable_param_count = sum(p.numel() for group in param_groups for p in group["params"])
         print(f"Trainable parameters: {self.trainable_param_count}")
-        optimizer = optim.Adam(trainable_params, lr=self.optimizer_cfg.lr)
+        for group in param_groups:
+            print(
+                f"[Optimizer] group={group['name']} "
+                f"num_tensors={len(group['params'])} "
+                f"lr={group['lr']:.6e}"
+            )
+        optimizer = optim.Adam(param_groups, lr=self.optimizer_cfg.lr)
         warm_up_steps = self.optimizer_cfg.warm_up_steps
         if self.optimizer_cfg.cosine_lr:
+            max_lrs = [group["lr"] for group in param_groups]
             warm_up = torch.optim.lr_scheduler.OneCycleLR(
-                            optimizer, self.optimizer_cfg.lr,
-                            self.trainer.max_steps + 1,
+                            optimizer,
+                            max_lr=max_lrs,
+                            total_steps=self.trainer.max_steps + 1,
                             pct_start=0.001,
                             cycle_momentum=False,
                             anneal_strategy='cos',

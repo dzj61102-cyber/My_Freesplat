@@ -12,10 +12,10 @@ budget_pruning:
   enabled: true
   keep_ratio: 0.8
   lambda_budget: 0.2
-  lambda_bin: 0.02
+  lambda_bin: 0.005
   tau_start: 0.5
-  tau_end: 0.2
-  total_steps: 300000
+  tau_end: 0.3
+  total_steps: 150000
 
 num_surfaces: 1
 

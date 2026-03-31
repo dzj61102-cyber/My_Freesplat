@@ -53,9 +53,9 @@ class BudgetPruningCfg:
     enabled: bool = True
     keep_ratio: float = 0.8
     lambda_budget: float = 0.2
-    lambda_bin: float = 0.02
+    lambda_bin: float = 0.005
     tau_start: float = 0.5
-    tau_end: float = 0.2
+    tau_end: float = 0.3
     total_steps: int = 300000
 
 
@@ -274,7 +274,7 @@ class EncoderFreeSplat(Encoder[EncoderFreeSplatCfg]):
             nn.Linear(64, 1),
         )
 
-    # 温度退火，温度呈指数规律从 tau_start(0.5) 衰减到 tau_end(0.2)
+    # 温度退火，温度呈指数规律从 tau_start 衰减到 tau_end
     def _pruning_temperature(self, global_step: int) -> float:
         cfg = self.cfg.budget_pruning
         if cfg.total_steps <= 0:
@@ -659,15 +659,25 @@ class EncoderFreeSplat(Encoder[EncoderFreeSplatCfg]):
                 rearrange(xy_ray[b:b+1], "b v r srf xy -> b v r srf () xy"),
                 # 融合后深度作为射线采样距离
                 rearrange(cur_depths, "b r -> b () r () ()"),
-                # 第 0~1 通道用于不透明度/密度参数
+                # 0 通道经过 sigmoid - 不透明度参数 ？？？
                 nn.Sigmoid()(rearrange(cur_gaussians_now[..., :1], "b r srf c -> b () r srf c")),
-                # 剩余通道作为几何与外观参数
+                # 从 2 通道开始 - 几何与外观参数
                 rearrange(cur_gaussians_now[..., 2:], "b r srf c -> b () r srf () c"),
                 (h, w),
                 fusion=False,
-                # 传入融合后坐标，避免重复反投影
+                # 融合后坐标-3D高斯中心
                 coords=rearrange(cur_coords, "b r c -> b () r () () c"),
             )
+
+            # 标准高斯对象cur_gaussians里包括：k表示三元组特征的第k通道
+            # means 直接来自三元组坐标coords
+            # covariances 依赖 scales + rotations + extrinsics旋转块
+            # harmonics 依赖 k=9..35（默认配置）+ sh_mask（由 sh_degree 决定）
+            # opacities 依赖k=0（经 sigmoid 后）
+            # scales 依赖 k=2..4，且还乘 depths、intrinsics、image_shape、gaussian_scale_min/max
+            # rotations 依赖 k=5..8（归一化）
+            # 彩色渲染只用前四个参数
+
             # 保存当前样本的全局高斯对象，our_gaussians = [样本0的高斯, 样本1的高斯, ...]
             our_gaussians.append(cur_gaussians)
             # 保留融合中间量，供后续按同索引访问每个全局高斯
@@ -893,12 +903,12 @@ class EncoderFreeSplat(Encoder[EncoderFreeSplatCfg]):
             # 特征融合/GRU 更新：weights 作为辅助输入一起参与
 
             if mask.sum() > 0:
-                # 把密度和权重做位置编码后送给 GRU，当成门控条件
-                # 当前视角的新点对应的权重/密度信息编码
+                # 把密度和深度置信度做位置编码后送给 GRU，当成门控条件
+                # 当前视角的新点对应的密度+深度置信度信息编码
                 input_weights_emb = positional_encoding(torch.cat([global_densities[:, mask], weight_emb[:, i, pixel_indices][:,fusion_indices_]], dim=-1), 6)
-                # 当前全局池中旧点对应的权重/密度信息编码
+                # 当前全局池中旧点对应的密度+深度置信度信息编码
                 hidden_weights_emb = positional_encoding(torch.cat([densities[:, i, pixel_indices][:,fusion_indices_], global_weight_emb[:, mask]], dim=-1), 6)
-                # GRU 融合“当前视角特征”和“全局特征”
+                # GRU 融合“当前视角特征”和“全局特征”，输入是当前和全局的64维高斯特征以及编码信息
                 # 为什么用 GRU
                 # GRU 本来是序列模型，但这里作者把它当成一种“带门控的特征更新器”：
                 # 保留旧信息多少
@@ -915,7 +925,7 @@ class EncoderFreeSplat(Encoder[EncoderFreeSplatCfg]):
                 weights_0 = global_densities[:, mask].repeat(1, 1, 1, 2)
                 weights_1 = densities[:, i, pixel_indices][:,fusion_indices_].repeat(1, 1, 1, 2)
 
-                # 位置、密度（权重）、深度权重（置信度）、外参、深度做加权融合，(旧值 * 旧权重 + 新值 * 新权重) / (旧权重 + 新权重)
+                # 位置、密度（权重）、深度置信度、外参、深度做加权融合，(旧值 * 旧权重 + 新值 * 新权重) / (旧权重 + 新权重)
                 global_coords = torch.cat([global_coords[:, ~mask], (global_coords[:, mask]*weights_0[...,1] +
                                                 coords[0][:, i, pixel_indices][:,fusion_indices_,0,0]*weights_1[...,1]) / (weights_0[...,1]+weights_1[...,1])], dim=1)
                 global_densities = torch.cat([global_densities[:, ~mask], (global_densities[:, mask] +
