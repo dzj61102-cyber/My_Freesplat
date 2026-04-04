@@ -430,7 +430,7 @@ class ModelWrapper(LightningModule):
         self.benchmarker = Benchmarker()
 
         self.losses_log = {}
-        # 先全冻结，再仅解冻 self.encoder.importance_head
+        # 先全冻结，再仅解冻 self.encoder.importance_head 与 self.encoder.to_gaussians
         if self.train_cfg.train_only_importance_head:
             for param in self.parameters():
                 param.requires_grad = False
@@ -439,7 +439,14 @@ class ModelWrapper(LightningModule):
                 raise ValueError(
                     "train.train_only_importance_head=true but encoder has no importance_head."
                 )
+            to_gaussians = getattr(self.encoder, "to_gaussians", None)
+            if to_gaussians is None:
+                raise ValueError(
+                    "train.train_only_importance_head=true but encoder has no to_gaussians."
+                )
             for param in importance_head.parameters():
+                param.requires_grad = True
+            for param in to_gaussians.parameters():
                 param.requires_grad = True
             # 打印可训练参数名预览   
             trainable_names = [
@@ -463,6 +470,9 @@ class ModelWrapper(LightningModule):
         self.num_evals = []
         self.test_scene_list = []
         self.test_fvs_list = []
+        self.val_fused_num_gaussians = []
+        self.val_rendered_num_gaussians = []
+        self.val_gaussian_retention_ratio = []
 
         for k1 in cfg_dict:
             try:
@@ -629,6 +639,13 @@ class ModelWrapper(LightningModule):
                 export_ply=self.encoder_visualizer.cfg.export_ply,
             )
             gaussians_full = encoder_results['gaussians']
+            # fused_num_gaussians: PTF 后且未经过体素聚合/剪枝的全局高斯数量。
+            fused_num_gaussians = float(
+                encoder_results.get(
+                    "fused_num_gaussians_before_voxel_aggregation",
+                    encoder_results.get("fused_num_gaussians", float("nan")),
+                )
+            )
 
             # 测试阶段输出每个场景的体素尺寸统计。
             if (
@@ -669,6 +686,11 @@ class ModelWrapper(LightningModule):
                     gaussians_full, self.test_cfg.save_ratio, self.test_cfg.pruning_mode
                 )
             rendered_num_gaussians = count_gaussians(gaussians)
+            gaussian_retention_ratio = (
+                fused_num_gaussians / float(rendered_num_gaussians)
+                if rendered_num_gaussians > 0
+                else float("nan")
+            )
             
         with self.benchmarker.time("decoder", num_calls=v):
             if not isinstance(gaussians, list):
@@ -710,7 +732,7 @@ class ModelWrapper(LightningModule):
         # Save images.
         (scene,) = batch["scene"]
         print(f'processing {scene}')
-        print(f"[RenderGaussians] scene={scene} num_gaussians={rendered_num_gaussians}")
+        print(f"gaussian_retention_ratio({scene}): {gaussian_retention_ratio:.6f}")
         self.test_scene_list.append(scene)
         name = get_cfg()["wandb"]["name"]
         path = self.test_cfg.output_path / name
@@ -787,8 +809,9 @@ class ModelWrapper(LightningModule):
             self.benchmarker.store('lpips_inter', float(lpips))
             self.benchmarker.store('ssim_inter', float(ssim))
             self.benchmarker.store('num_inter', float(num))
-            self.benchmarker.store('num_gaussians', encoder_results['num_gaussians'])
+            self.benchmarker.store('fused_num_gaussians', fused_num_gaussians)
             self.benchmarker.store('rendered_num_gaussians', rendered_num_gaussians)
+            self.benchmarker.store('gaussian_retention_ratio', gaussian_retention_ratio)
             self.test_fvs_list.append(False)
         else:
             length = batch["target"]["index"][0].shape[0]
@@ -805,8 +828,9 @@ class ModelWrapper(LightningModule):
             self.benchmarker.store('lpips_extra', float(lpips_extra))
             self.benchmarker.store('ssim_extra', float(ssim_extra))
             self.benchmarker.store('num_extra', float(num_extra))
-            self.benchmarker.store('num_gaussians', encoder_results['num_gaussians'])
+            self.benchmarker.store('fused_num_gaussians', fused_num_gaussians)
             self.benchmarker.store('rendered_num_gaussians', rendered_num_gaussians)
+            self.benchmarker.store('gaussian_retention_ratio', gaussian_retention_ratio)
             self.test_fvs_list.append(True)
         if self.encoder_visualizer is not None:
             for k, image in self.encoder_visualizer.visualize(
@@ -835,7 +859,8 @@ class ModelWrapper(LightningModule):
                                 self.benchmarker.benchmarks['depth_abs_diff'][i],
                                 self.benchmarker.benchmarks['depth_rel_diff'][i],
                                 self.benchmarker.benchmarks['depth_delta_25'][i],
-                                self.benchmarker.benchmarks['depth_delta_10'][i])
+                                self.benchmarker.benchmarks['depth_delta_10'][i],
+                                self.benchmarker.benchmarks['gaussian_retention_ratio'][i])
             else:
                 print(self.test_scene_list[i], self.benchmarker.benchmarks['psnr_inter'][i], 
                                 self.benchmarker.benchmarks['ssim_inter'][i],
@@ -843,7 +868,8 @@ class ModelWrapper(LightningModule):
                                 self.benchmarker.benchmarks['depth_abs_diff'][i],
                                 self.benchmarker.benchmarks['depth_rel_diff'][i],
                                 self.benchmarker.benchmarks['depth_delta_25'][i],
-                                self.benchmarker.benchmarks['depth_delta_10'][i])
+                                self.benchmarker.benchmarks['depth_delta_10'][i],
+                                self.benchmarker.benchmarks['gaussian_retention_ratio'][i])
             if np.isnan(self.benchmarker.benchmarks['depth_abs_diff'][i]) or np.isnan(self.benchmarker.benchmarks['depth_rel_diff'][i]) or np.isnan(self.benchmarker.benchmarks['depth_delta_25'][i]) or np.isnan(self.benchmarker.benchmarks['depth_delta_10'][i]):
                 nan_scenes.append(self.test_scene_list[i])
         inter_num = np.array(self.benchmarker.benchmarks['num_inter'])
@@ -856,14 +882,19 @@ class ModelWrapper(LightningModule):
         depth_delta_10_avg = torch.nanmean(torch.tensor(self.benchmarker.benchmarks['depth_delta_10'])).cpu().numpy()
         mean_encoder_time = np.mean(self.benchmarker.execution_times["encoder"]) if len(self.benchmarker.execution_times["encoder"]) > 0 else float("nan")
         mean_decoder_time = np.mean(self.benchmarker.execution_times["decoder"]) if len(self.benchmarker.execution_times["decoder"]) > 0 else float("nan")
+        mean_encoder_decoder_time_sum = (
+            mean_encoder_time + mean_decoder_time
+            if np.isfinite(mean_encoder_time) and np.isfinite(mean_decoder_time)
+            else float("nan")
+        )
         fps = (1.0 / mean_decoder_time) if np.isfinite(mean_decoder_time) and mean_decoder_time > 0 else float("nan")
         peak_memory_bytes = torch.cuda.memory_stats()["allocated_bytes.all.peak"] if torch.cuda.is_available() else 0.0
         peak_memory_gb = peak_memory_bytes / (1024 ** 3)
         summary_metrics = {}
-        def log_metric(key, value):
+        def log_metric(key, value, decimals=3):
             value = float(value)
-            print(f'{key}: {value:.3f}')
-            summary_metrics[key] = f"{value:.3f}"
+            print(f'{key}: {value:.{decimals}f}')
+            summary_metrics[key] = f"{value:.{decimals}f}"
 
         log_metric('psnr_inter_avg', psnr_inter_avg)
         log_metric('ssim_inter_avg', ssim_inter_avg)
@@ -884,12 +915,21 @@ class ModelWrapper(LightningModule):
             pass
         rendered_num_gaussians_avg = self.benchmarker.benchmarks.get(
             "rendered_num_gaussians_avg",
-            self.benchmarker.benchmarks["num_gaussians_avg"] * self.test_cfg.save_ratio,
+            self.benchmarker.benchmarks["fused_num_gaussians_avg"] * self.test_cfg.save_ratio,
         )
-        log_metric('num_gaussians_avg', self.benchmarker.benchmarks["num_gaussians_avg"])
+        gaussian_retention_ratio_avg = self.benchmarker.benchmarks.get(
+            "gaussian_retention_ratio_avg",
+            self.benchmarker.benchmarks["fused_num_gaussians_avg"] / rendered_num_gaussians_avg
+            if np.isfinite(rendered_num_gaussians_avg) and rendered_num_gaussians_avg > 0
+            else float("nan"),
+        )
+        log_metric('fused_num_gaussians_avg', self.benchmarker.benchmarks["fused_num_gaussians_avg"])
         log_metric('rendered_num_gaussians_avg', rendered_num_gaussians_avg)
+        log_metric('gaussian_retention_ratio_avg', gaussian_retention_ratio_avg)
         log_metric('peak_memory_gb', peak_memory_gb)
-        log_metric('mean_encoder_time', mean_encoder_time)
+        log_metric('mean_encoder_time', mean_encoder_time, decimals=6)
+        log_metric('mean_decoder_time', mean_decoder_time, decimals=6)
+        log_metric('mean_encoder_decoder_time_sum', mean_encoder_decoder_time_sum, decimals=6)
         log_metric('fps', fps)
         summary_metrics_path = self.test_cfg.output_path / "terminal_metrics.json"
         summary_metrics_path.parent.mkdir(parents=True, exist_ok=True)
@@ -938,6 +978,25 @@ class ModelWrapper(LightningModule):
             pruning_mode=3,
             importance_scores=importance_scores,
         )
+        # 验证统计口径与测试一致：记录 PTF 后、未体素聚合/剪枝前的全局高斯数量。
+        fused_num_gaussians = float(
+            encoder_probabilistic_results.get(
+                "fused_num_gaussians_before_voxel_aggregation",
+                encoder_probabilistic_results.get("fused_num_gaussians", float("nan")),
+            )
+        )
+        rendered_num_gaussians = float(count_gaussians(gaussians_probabilistic))
+        gaussian_retention_ratio = (
+            fused_num_gaussians / rendered_num_gaussians
+            if rendered_num_gaussians > 0
+            else float("nan")
+        )
+        self.val_fused_num_gaussians.append(fused_num_gaussians)
+        self.val_rendered_num_gaussians.append(rendered_num_gaussians)
+        self.val_gaussian_retention_ratio.append(gaussian_retention_ratio)
+        self.log("val/fused_num_gaussians", fused_num_gaussians)
+        self.log("val/rendered_num_gaussians", rendered_num_gaussians)
+        self.log("val/gaussian_retention_ratio", gaussian_retention_ratio)
         if not isinstance(gaussians_probabilistic, list):
             output_probabilistic = self.decoder.forward(
                 gaussians_probabilistic,
@@ -1060,11 +1119,18 @@ class ModelWrapper(LightningModule):
                     line = line + f'{metric}=' + str((np.array(self.metrics[metric])*np.array(self.num_evals)).sum() / np.array(self.num_evals).sum()) + ' '
                 except:
                     pass
+            fused_avg = float(np.nanmean(np.asarray(self.val_fused_num_gaussians, dtype=float))) if len(self.val_fused_num_gaussians) > 0 else float("nan")
+            rendered_avg = float(np.nanmean(np.asarray(self.val_rendered_num_gaussians, dtype=float))) if len(self.val_rendered_num_gaussians) > 0 else float("nan")
+            ratio_avg = float(np.nanmean(np.asarray(self.val_gaussian_retention_ratio, dtype=float))) if len(self.val_gaussian_retention_ratio) > 0 else float("nan")
+            line = line + f'fused_num_gaussians_avg={fused_avg} rendered_num_gaussians_avg={rendered_avg} gaussian_retention_ratio_avg={ratio_avg}'
             f.write(line + '\n')
             print(line)
         for metric in ['psnr', 'lpips', 'ssim']:
             self.metrics[metric] = []
-            self.num_evals = []
+        self.num_evals = []
+        self.val_fused_num_gaussians = []
+        self.val_rendered_num_gaussians = []
+        self.val_gaussian_retention_ratio = []
 
     @rank_zero_only
     def render_video_wobble(self, batch: BatchedExample) -> None:
@@ -1234,16 +1300,40 @@ class ModelWrapper(LightningModule):
                 )
     # 仅收集 requires_grad=True 参数，并打印可训练参数量
     def configure_optimizers(self):
-        trainable_params = [p for p in self.parameters() if p.requires_grad]
-        if len(trainable_params) == 0:
-            raise ValueError("No trainable parameters found for optimizer.")
+        if self.train_cfg.train_only_importance_head:
+            importance_head = getattr(self.encoder, "importance_head", None)
+            to_gaussians = getattr(self.encoder, "to_gaussians", None)
+            if importance_head is None or to_gaussians is None:
+                raise ValueError(
+                    "train_only_importance_head mode requires encoder.importance_head and encoder.to_gaussians."
+                )
+            importance_params = [p for p in importance_head.parameters() if p.requires_grad]
+            to_gaussians_params = [p for p in to_gaussians.parameters() if p.requires_grad]
+            if len(importance_params) == 0 or len(to_gaussians_params) == 0:
+                raise ValueError(
+                    "No trainable parameters found in importance_head/to_gaussians."
+                )
+            param_groups = [
+                {"params": importance_params, "lr": 1e-4},
+                {"params": to_gaussians_params, "lr": 1e-5},
+            ]
+            trainable_params = importance_params + to_gaussians_params
+            max_lrs = [1e-4, 1e-5]
+            print("LR groups: importance_head=1e-4, to_gaussians=1e-5")
+        else:
+            trainable_params = [p for p in self.parameters() if p.requires_grad]
+            if len(trainable_params) == 0:
+                raise ValueError("No trainable parameters found for optimizer.")
+            param_groups = [{"params": trainable_params, "lr": self.optimizer_cfg.lr}]
+            max_lrs = self.optimizer_cfg.lr
+
         self.trainable_param_count = sum(p.numel() for p in trainable_params)
         print(f"Trainable parameters: {self.trainable_param_count}")
-        optimizer = optim.Adam(trainable_params, lr=self.optimizer_cfg.lr)
+        optimizer = optim.Adam(param_groups)
         warm_up_steps = self.optimizer_cfg.warm_up_steps
         if self.optimizer_cfg.cosine_lr:
             warm_up = torch.optim.lr_scheduler.OneCycleLR(
-                            optimizer, self.optimizer_cfg.lr,
+                            optimizer, max_lrs,
                             self.trainer.max_steps + 1,
                             pct_start=0.001,
                             cycle_momentum=False,

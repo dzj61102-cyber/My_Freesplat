@@ -366,7 +366,7 @@ class EncoderFreeSplat(Encoder[EncoderFreeSplatCfg]):
 
         counts = torch.bincount(inverse, minlength=n_voxels).to(means.dtype)
 
-        # Step 4: 体素内 z-score 标准化；聚合权重 w = softmax(s / tau)。
+        # Step 4: 体素内 z-score 标准化得到u；体素内聚合权重 w = softmax(u / tau)。
         score_sum = torch.zeros(n_voxels, device=means.device, dtype=means.dtype)
         score_sum.index_add_(0, inverse, scores)
         score_sq_sum = torch.zeros(n_voxels, device=means.device, dtype=means.dtype)
@@ -374,7 +374,7 @@ class EncoderFreeSplat(Encoder[EncoderFreeSplatCfg]):
         score_mean = score_sum / torch.clamp_min(counts, 1.0)
         score_var = (score_sq_sum / torch.clamp_min(counts, 1.0) - score_mean * score_mean).clamp_min(0.0)
         score_std = torch.sqrt(score_var + 1e-6)
-        zscores = (scores - score_mean[inverse]) / score_std[inverse]
+        zscores = (scores - score_mean[inverse]) / score_std[inverse]#每个原始高斯在其所属体素内的 z-score 标准化分数
 
         logits = zscores / tau_tensor
         group_max = torch.full((n_voxels,), -torch.inf, device=means.device, dtype=means.dtype)
@@ -384,7 +384,7 @@ class EncoderFreeSplat(Encoder[EncoderFreeSplatCfg]):
         group_exp_sum.index_add_(0, inverse, exp_logits)
         weights = exp_logits / torch.clamp_min(group_exp_sum[inverse], eps)
 
-        # Step 5: 体素内聚合（中心/协方差/SH 加权，分数求和，不透明度按 rho 组合）。
+        # Step 5: 体素内聚合（中心/SH 加权，分数求和，不透明度按 w 组合,协方差二阶矩合成）。
         agg_means = torch.zeros((n_voxels, 3), device=means.device, dtype=means.dtype)
         agg_means.index_add_(0, inverse, weights[:, None] * means)
 
@@ -404,17 +404,16 @@ class EncoderFreeSplat(Encoder[EncoderFreeSplatCfg]):
         agg_sh_flat.index_add_(0, inverse, weights[:, None] * sh_flat)
         agg_harmonics = agg_sh_flat.reshape(n_voxels, harmonics.shape[1], harmonics.shape[2])
 
-        # rho_i = s_i / sum_{j in voxel} s_j，分母接近 0 时回退为均匀权重。
-        rho_den = score_sum[inverse]
-        uniform_rho = 1.0 / torch.clamp_min(counts[inverse], 1.0)
-        rho = torch.where(rho_den.abs() > eps, scores / rho_den, uniform_rho)
         alpha = opacities.clamp(0.0, 1.0 - 1e-6)
-        log_terms = rho * torch.log1p(-alpha)
+        log_terms = weights * torch.log1p(-alpha)
         log_prod = torch.zeros(n_voxels, device=means.device, dtype=means.dtype)
         log_prod.index_add_(0, inverse, log_terms)
         agg_opacities = (1.0 - torch.exp(log_prod)).clamp(0.0, 1.0)
 
-        agg_scores = score_sum
+        # 每个体素聚合后的重要性分数：softplus(scores) 按聚合权重 w 加权叠加。
+        score_sp = torch.nn.functional.softplus(scores)
+        agg_scores = torch.zeros(n_voxels, device=means.device, dtype=means.dtype)
+        agg_scores.index_add_(0, inverse, weights * score_sp)
         aggregated = Gaussians(
             agg_means.unsqueeze(0),
             agg_covariances.unsqueeze(0),
@@ -801,7 +800,7 @@ class EncoderFreeSplat(Encoder[EncoderFreeSplatCfg]):
         num_gaussians = our_gaussians[0].means.shape[2]
         results['gs_ratio'] = num_gaussians / num_raw_gaussians
         gaussians = cur_gaussians #把 gaussians 赋成了最后一个样本的 cur_gaussians
-        results['num_gaussians'] = num_gaussians
+        results['fused_num_gaussians'] = num_gaussians
 
 
         # 准备可视化数据
@@ -853,7 +852,7 @@ class EncoderFreeSplat(Encoder[EncoderFreeSplatCfg]):
         # - results['gaussians_fused_weights'][i][:, g]
         # 例：对于样本scene0000_01_0：
         # results['gs_ratio']: 0.5598941379123263
-        # results['num_gaussians']: 330239（融合后高斯数量）
+        # results['fused_num_gaussians']: 330239（融合后高斯数量）
         # results['gaussians'][0].means shape: torch.Size([1, 330239, 3])
         # results['gaussians'][0].covariances shape: torch.Size([1, 330239, 3, 3])
         # results['gaussians'][0].harmonics shape: torch.Size([1, 330239, 3, 9])
@@ -895,12 +894,12 @@ class EncoderFreeSplat(Encoder[EncoderFreeSplatCfg]):
             aggregated_zscores.append(z_agg)
             test_num_gaussians_aggregated.append(n_agg)
 
-        results["num_gaussians_before_voxel_aggregation"] = results["num_gaussians"]
+        results["fused_num_gaussians_before_voxel_aggregation"] = results["fused_num_gaussians"]
         final_gs = aggregated_gs
         results["gaussians"] = final_gs
         results["gaussians_importance_scores"] = aggregated_scores
         results["gaussians_voxel_zscores"] = aggregated_zscores
-        results["num_gaussians"] = int(sum(int(gs.means.shape[1]) for gs in final_gs))
+        results["fused_num_gaussians"] = int(sum(int(gs.means.shape[1]) for gs in final_gs))
         results["test_voxel_size"] = test_voxel_size
         results["test_voxel_size_raw"] = test_voxel_size_raw
         results["test_bbox_diag"] = test_bbox_diag
@@ -909,7 +908,7 @@ class EncoderFreeSplat(Encoder[EncoderFreeSplatCfg]):
             results["prune_keep_ratio"] = self.cfg.budget_pruning.keep_ratio
         # 打印
         # print(f"[EncoderFreeSplat] results['gs_ratio']: {results['gs_ratio']}")
-        # print(f"[EncoderFreeSplat] results['num_gaussians']: {results['num_gaussians']}")
+        # print(f"[EncoderFreeSplat] results['fused_num_gaussians']: {results['fused_num_gaussians']}")
 
         # for idx, gs in enumerate(results['gaussians']):
         #     print(f"[EncoderFreeSplat] results['gaussians'][{idx}].means shape: {gs.means.shape}")
