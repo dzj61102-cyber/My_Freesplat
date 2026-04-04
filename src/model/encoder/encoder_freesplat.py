@@ -300,6 +300,128 @@ class EncoderFreeSplat(Encoder[EncoderFreeSplatCfg]):
 
         # 将概率密度映射为不透明度，兼顾低密度与高密度区域梯度
         return 0.5 * (1 - (1 - pdf) ** exponent + pdf ** (1 / exponent))
+
+    def _compute_voxel_size_from_gaussians(
+        self,
+        gs: Gaussians,
+    ) -> tuple[Tensor, Tensor, Tensor]:
+        """按规则计算体素边长（仅前两步：初始值 + 包围盒约束）。
+
+        Returns:
+            (v_limited, v_raw, bbox_diag) 均为标量 Tensor。
+        """
+        means = gs.means
+        covariances = gs.covariances
+        # 兼容输入 [B, G, ...]，测试阶段 B=1。
+        means = means.reshape(-1, means.shape[-2], means.shape[-1])[0]
+        covariances = covariances.reshape(
+            -1, covariances.shape[-3], covariances.shape[-2], covariances.shape[-1]
+        )[0]
+
+        # Step 1: v = 2.5 * median((x1*x2*x3)^(1/6))
+        eigvals = torch.linalg.eigvalsh(covariances).clamp_min(0.0)
+        scale_proxy = eigvals.prod(dim=-1).clamp_min(1e-24).pow(1.0 / 6.0)
+        m = torch.median(scale_proxy)
+        v_raw = 2.5 * m
+
+        # Step 2: L = ||mu_max - mu_min||_2, 并限制 v 到 [0.002L, 0.02L]
+        mu_max = means.max(dim=0).values
+        mu_min = means.min(dim=0).values
+        bbox_diag = torch.linalg.norm(mu_max - mu_min, ord=2)
+        v_min = 0.0001 * bbox_diag
+        v_max = 0.0003 * bbox_diag
+        v_limited = torch.clamp(v_raw, min=v_min, max=v_max)
+
+        # 退化盒子（L≈0）时，保留非零 v_raw，避免后续体素划分除零。
+        eps = torch.tensor(1e-8, device=v_limited.device, dtype=v_limited.dtype)
+        v_limited = torch.where(bbox_diag <= eps, torch.clamp_min(v_raw, eps), v_limited)
+        return v_limited, v_raw, bbox_diag
+
+    def _voxel_aggregate_gaussians(
+        self,
+        gs: Gaussians,
+        scores: Tensor,
+        voxel_size: Tensor,
+        tau: float = 0.5,
+    ) -> tuple[Gaussians, Tensor, Tensor, Tensor]:
+        """按体素聚合单样本高斯（步骤 3-5）。"""
+        means = gs.means.reshape(-1, gs.means.shape[-2], gs.means.shape[-1])[0]
+        covariances = gs.covariances.reshape(
+            -1, gs.covariances.shape[-3], gs.covariances.shape[-2], gs.covariances.shape[-1]
+        )[0]
+        harmonics = gs.harmonics.reshape(-1, gs.harmonics.shape[-3], gs.harmonics.shape[-2], gs.harmonics.shape[-1])[0]
+        opacities = gs.opacities.reshape(-1, gs.opacities.shape[-1])[0]
+        scores = scores.reshape(-1, scores.shape[-1])[0]
+
+        eps = torch.tensor(1e-8, device=means.device, dtype=means.dtype)
+        tau_tensor = torch.tensor(max(tau, 1e-6), device=means.device, dtype=means.dtype)
+
+        # Step 3: k_i = floor((mu_i - mu_min) / v)，按体素索引分组。
+        mu_min = means.min(dim=0).values
+        voxel_indices = torch.floor((means - mu_min) / torch.clamp_min(voxel_size, eps)).to(torch.long)
+        _, inverse = torch.unique(voxel_indices, dim=0, return_inverse=True)
+        n_voxels = int(inverse.max().item()) + 1 if inverse.numel() > 0 else 0
+        if n_voxels == 0:
+            return gs, scores.unsqueeze(0), scores.unsqueeze(0), torch.tensor(0, device=means.device)
+
+        counts = torch.bincount(inverse, minlength=n_voxels).to(means.dtype)
+
+        # Step 4: 体素内 z-score 标准化；聚合权重 w = softmax(s / tau)。
+        score_sum = torch.zeros(n_voxels, device=means.device, dtype=means.dtype)
+        score_sum.index_add_(0, inverse, scores)
+        score_sq_sum = torch.zeros(n_voxels, device=means.device, dtype=means.dtype)
+        score_sq_sum.index_add_(0, inverse, scores * scores)
+        score_mean = score_sum / torch.clamp_min(counts, 1.0)
+        score_var = (score_sq_sum / torch.clamp_min(counts, 1.0) - score_mean * score_mean).clamp_min(0.0)
+        score_std = torch.sqrt(score_var + 1e-6)
+        zscores = (scores - score_mean[inverse]) / score_std[inverse]
+
+        logits = zscores / tau_tensor
+        group_max = torch.full((n_voxels,), -torch.inf, device=means.device, dtype=means.dtype)
+        group_max.scatter_reduce_(0, inverse, logits, reduce="amax", include_self=True)
+        exp_logits = torch.exp(logits - group_max[inverse])
+        group_exp_sum = torch.zeros(n_voxels, device=means.device, dtype=means.dtype)
+        group_exp_sum.index_add_(0, inverse, exp_logits)
+        weights = exp_logits / torch.clamp_min(group_exp_sum[inverse], eps)
+
+        # Step 5: 体素内聚合（中心/协方差/SH 加权，分数求和，不透明度按 rho 组合）。
+        agg_means = torch.zeros((n_voxels, 3), device=means.device, dtype=means.dtype)
+        agg_means.index_add_(0, inverse, weights[:, None] * means)
+
+        # 协方差按二阶矩合成：
+        # Sigma'_m = sum_i w_i * (Sigma_i + (mu_i - mu'_m)(mu_i - mu'_m)^T)
+        mean_offsets = means - agg_means[inverse]
+        outer = mean_offsets[:, :, None] * mean_offsets[:, None, :]
+        second_moment_terms = covariances + outer
+        second_flat = second_moment_terms.reshape(second_moment_terms.shape[0], -1)
+        agg_cov_flat = torch.zeros((n_voxels, second_flat.shape[-1]), device=means.device, dtype=means.dtype)
+        agg_cov_flat.index_add_(0, inverse, weights[:, None] * second_flat)
+        agg_covariances = agg_cov_flat.reshape(n_voxels, 3, 3)
+        agg_covariances = 0.5 * (agg_covariances + agg_covariances.transpose(-1, -2))
+
+        sh_flat = harmonics.reshape(harmonics.shape[0], -1)
+        agg_sh_flat = torch.zeros((n_voxels, sh_flat.shape[-1]), device=means.device, dtype=means.dtype)
+        agg_sh_flat.index_add_(0, inverse, weights[:, None] * sh_flat)
+        agg_harmonics = agg_sh_flat.reshape(n_voxels, harmonics.shape[1], harmonics.shape[2])
+
+        # rho_i = s_i / sum_{j in voxel} s_j，分母接近 0 时回退为均匀权重。
+        rho_den = score_sum[inverse]
+        uniform_rho = 1.0 / torch.clamp_min(counts[inverse], 1.0)
+        rho = torch.where(rho_den.abs() > eps, scores / rho_den, uniform_rho)
+        alpha = opacities.clamp(0.0, 1.0 - 1e-6)
+        log_terms = rho * torch.log1p(-alpha)
+        log_prod = torch.zeros(n_voxels, device=means.device, dtype=means.dtype)
+        log_prod.index_add_(0, inverse, log_terms)
+        agg_opacities = (1.0 - torch.exp(log_prod)).clamp(0.0, 1.0)
+
+        agg_scores = score_sum
+        aggregated = Gaussians(
+            agg_means.unsqueeze(0),
+            agg_covariances.unsqueeze(0),
+            agg_harmonics.unsqueeze(0),
+            agg_opacities.unsqueeze(0),
+        )
+        return aggregated, agg_scores.unsqueeze(0), zscores.unsqueeze(0), torch.tensor(n_voxels, device=means.device)
     
     def forward(
         self,
@@ -738,51 +860,53 @@ class EncoderFreeSplat(Encoder[EncoderFreeSplatCfg]):
         # results['gaussians'][0].opacities shape: torch.Size([1, 330239])
         # results['gaussians_fused_features'][0] shape: torch.Size([1, 330239, 64])
         # results['gaussians_fused_weights'][0] shape: torch.Size([1, 330239])
-   
-        if self.cfg.budget_pruning.enabled:
-            cfg_prune = self.cfg.budget_pruning
-            tau = None if is_testing else self._pruning_temperature(global_step)
-            scores_per_sample = []
-            gates_per_sample = []
-            pruned_gaussians = []
-            budget_terms = []
-            bin_terms = []
-            # gs原始标准高斯对象, feat高斯融合特征, weight高斯融合权重
-            for gs, feat, weight in zip(final_gs, fused_features, fused_weights_flat):
+
+        # 在 train/val/test 统一执行与测试阶段一致的体素聚合流程。
+        test_voxel_size = []
+        test_voxel_size_raw = []
+        test_bbox_diag = []
+        test_num_gaussians_aggregated = []
+        aggregated_gs = []
+        aggregated_scores = []
+        aggregated_zscores = []
+        for idx, gs in enumerate(final_gs):
+            v_limited, v_raw, bbox_diag = self._compute_voxel_size_from_gaussians(gs)
+            test_voxel_size.append(v_limited)
+            test_voxel_size_raw.append(v_raw)
+            test_bbox_diag.append(bbox_diag)
+
+            if self.cfg.budget_pruning.enabled:
+                feat = fused_features[idx]
+                weight = fused_weights_flat[idx]
                 z = torch.cat(
                     [feat, torch.log1p(weight).unsqueeze(-1), gs.opacities.unsqueeze(-1)],
                     dim=-1,
                 )
                 scores = self.importance_head(z).squeeze(-1)
-                scores_per_sample.append(scores)#重要性分数
-                if not is_testing:#训练软门控
-                    gates = torch.sigmoid(scores / tau)
-                    gates_per_sample.append(gates)
-                    pruned_gaussians.append(
-                        Gaussians(#剪枝后的高斯对象，opacities乘以 gates 软门控
-                            gs.means,
-                            gs.covariances,
-                            gs.harmonics,
-                            gs.opacities * gates,
-                        )
-                    )
-                    budget_terms.append((gates.mean() - cfg_prune.keep_ratio) ** 2)#预算损失，鼓励平均保留率接近目标 keep_ratio
-                    bin_terms.append((gates * (1 - gates)).mean())#二值化正则项，鼓励 gate 接近 0 或 1
-                else:#测试直接硬剪枝,不改变高斯属性
-                    pruned_gaussians.append(gs)
+            else:
+                # 若未启用 learned score，则回退到 opacity 作为重要性分数。
+                scores = gs.opacities
 
-            results['gaussians'] = pruned_gaussians#原有高斯对象被覆盖
-            results['gaussians_importance_scores'] = scores_per_sample
-            results['prune_keep_ratio'] = cfg_prune.keep_ratio
-            if not is_testing:
-                results['gaussians_soft_gates'] = gates_per_sample
-                results['prune_budget_loss'] = cfg_prune.lambda_budget * torch.stack(budget_terms).mean()
-                results['prune_bin_loss'] = cfg_prune.lambda_bin * torch.stack(bin_terms).mean()
-                results['prune_gate_ratio'] = torch.stack([x.mean() for x in gates_per_sample]).mean()
-                results['prune_tau'] = torch.tensor(
-                    tau, device=device, dtype=final_gs[0].opacities.dtype
-                )
+            gs_agg, s_agg, z_agg, n_agg = self._voxel_aggregate_gaussians(
+                gs, scores, v_limited, tau=0.5
+            )
+            aggregated_gs.append(gs_agg)
+            aggregated_scores.append(s_agg)
+            aggregated_zscores.append(z_agg)
+            test_num_gaussians_aggregated.append(n_agg)
 
+        results["num_gaussians_before_voxel_aggregation"] = results["num_gaussians"]
+        final_gs = aggregated_gs
+        results["gaussians"] = final_gs
+        results["gaussians_importance_scores"] = aggregated_scores
+        results["gaussians_voxel_zscores"] = aggregated_zscores
+        results["num_gaussians"] = int(sum(int(gs.means.shape[1]) for gs in final_gs))
+        results["test_voxel_size"] = test_voxel_size
+        results["test_voxel_size_raw"] = test_voxel_size_raw
+        results["test_bbox_diag"] = test_bbox_diag
+        results["test_num_gaussians_aggregated"] = test_num_gaussians_aggregated
+        if self.cfg.budget_pruning.enabled:
+            results["prune_keep_ratio"] = self.cfg.budget_pruning.keep_ratio
         # 打印
         # print(f"[EncoderFreeSplat] results['gs_ratio']: {results['gs_ratio']}")
         # print(f"[EncoderFreeSplat] results['num_gaussians']: {results['num_gaussians']}")

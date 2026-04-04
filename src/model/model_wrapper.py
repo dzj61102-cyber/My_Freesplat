@@ -546,26 +546,6 @@ class ModelWrapper(LightningModule):
             total_loss = total_loss + loss
             self.losses_log[loss_fn.name] = self.losses_log.get(loss_fn.name, [])
             self.losses_log[loss_fn.name].append(loss)
-        if "prune_budget_loss" in encoder_results and "prune_bin_loss" in encoder_results:
-            # 预算感知剪枝附加损失（由 encoder 计算后回传）：
-            # prune_budget_loss: 约束 mean(gate) 接近 keep_ratio(rho)
-            # prune_bin_loss:    约束 gate 向 0/1 靠拢，便于后续 hard 剪枝
-            prune_budget_loss = encoder_results["prune_budget_loss"]
-            prune_bin_loss = encoder_results["prune_bin_loss"]
-            # 总损失 = 主渲染损失 + 剪枝正则项。
-            total_loss = total_loss + prune_budget_loss + prune_bin_loss
-            self.log("loss/prune_budget", prune_budget_loss, on_step=True, on_epoch=True, sync_dist=True, logger=True)
-            self.log("loss/prune_bin", prune_bin_loss, on_step=True, on_epoch=True, sync_dist=True, logger=True)
-            self.losses_log["prune_budget"] = self.losses_log.get("prune_budget", [])
-            self.losses_log["prune_budget"].append(prune_budget_loss)
-            self.losses_log["prune_bin"] = self.losses_log.get("prune_bin", [])
-            self.losses_log["prune_bin"].append(prune_bin_loss)
-            if "prune_gate_ratio" in encoder_results:
-                # gate 平均激活率（可与 keep_ratio 对比观察预算约束是否生效）。
-                self.log("prune/gate_ratio", encoder_results["prune_gate_ratio"], on_step=True, on_epoch=True, sync_dist=True, logger=True)
-            if "prune_tau" in encoder_results:
-                # 当前温度 tau（退火过程监控）。
-                self.log("prune/tau", encoder_results["prune_tau"], on_step=True, on_epoch=True, sync_dist=True, logger=True)
         self.log("loss/total", total_loss, on_step=True, on_epoch=True, sync_dist=True, logger=True)
         self.loss_total.append(total_loss)
         context_indices = batch['context']['index'].tolist()
@@ -650,6 +630,24 @@ class ModelWrapper(LightningModule):
             )
             gaussians_full = encoder_results['gaussians']
 
+            # 测试阶段输出每个场景的体素尺寸统计。
+            if (
+                "test_voxel_size" in encoder_results
+                and "test_voxel_size_raw" in encoder_results
+                and "test_bbox_diag" in encoder_results
+            ):
+                for i, scene in enumerate(batch["scene"]):
+                    voxel_size = float(encoder_results["test_voxel_size"][i].detach().cpu().item())
+                    v_raw = float(encoder_results["test_voxel_size_raw"][i].detach().cpu().item())
+                    bbox_diag = float(encoder_results["test_bbox_diag"][i].detach().cpu().item())
+                    v_min = 0.0001 * bbox_diag
+                    v_max = 0.0003 * bbox_diag
+                    print(
+                        f"[VoxelSize] scene={scene} "
+                        f"v={voxel_size:.8f} v_raw={v_raw:.8f} "
+                        f"v_min={v_min:.8f} v_max={v_max:.8f}"
+                    )
+
             # encoder 输出的 learned importance 分数（mode=3 使用）。
             importance_scores = encoder_results.get("gaussians_importance_scores", None)
             if self.test_cfg.pruning_mode == 3:
@@ -712,6 +710,7 @@ class ModelWrapper(LightningModule):
         # Save images.
         (scene,) = batch["scene"]
         print(f'processing {scene}')
+        print(f"[RenderGaussians] scene={scene} num_gaussians={rendered_num_gaussians}")
         self.test_scene_list.append(scene)
         name = get_cfg()["wandb"]["name"]
         path = self.test_cfg.output_path / name
