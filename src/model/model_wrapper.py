@@ -321,6 +321,22 @@ def count_gaussians(gaussians) -> int:
         return sum(int(gs.means.shape[1]) for gs in gaussians)
     return int(gaussians.means.shape[1])
 
+
+def to_scalar_mean(value) -> float:
+    if value is None:
+        return float("nan")
+    if isinstance(value, Tensor):
+        return float(value.detach().float().mean().cpu().item())
+    if isinstance(value, (list, tuple)):
+        if len(value) == 0:
+            return float("nan")
+        return float(np.nanmean(np.asarray(value, dtype=float)))
+    try:
+        return float(value)
+    except (TypeError, ValueError):
+        return float("nan")
+
+
 # Compute Depth metrics at novel views.
 def depth_render_metrics(prediction, batch) -> Float[Tensor, ""]:
     if not 'depth' in batch['target']:
@@ -473,6 +489,7 @@ class ModelWrapper(LightningModule):
         self.val_fused_num_gaussians = []
         self.val_rendered_num_gaussians = []
         self.val_gaussian_retention_ratio = []
+        self.val_gs_ratio = []
 
         for k1 in cfg_dict:
             try:
@@ -569,7 +586,20 @@ class ModelWrapper(LightningModule):
             for name in self.losses_log:
                 to_print = to_print + f' loss_{name} = {torch.mean(torch.tensor(self.losses_log[name])):.6f}'
             if 'gs_ratio' in encoder_results:
-                to_print = to_print + f' gs_ratio = {torch.mean(torch.tensor(encoder_results["gs_ratio"])):.6f}'
+                to_print = to_print + f' gs_ratio = {to_scalar_mean(encoder_results["gs_ratio"]):.6f}'
+            fused_num_gaussians = float(
+                encoder_results.get(
+                    "fused_num_gaussians_before_voxel_aggregation",
+                    encoder_results.get("fused_num_gaussians", float("nan")),
+                )
+            )
+            rendered_num_gaussians = float(count_gaussians(gaussians))
+            gaussian_retention_ratio = (
+                rendered_num_gaussians / fused_num_gaussians
+                if np.isfinite(fused_num_gaussians) and fused_num_gaussians > 0
+                else float("nan")
+            )
+            to_print = to_print + f' gaussian_retention_ratio = {gaussian_retention_ratio:.6f}'
             print(to_print)
             # 训练循环中的梯度范数检查，特别关注 importance_head 和一个冻结参数的梯度。
             if self.train_cfg.train_only_importance_head:
@@ -658,7 +688,7 @@ class ModelWrapper(LightningModule):
                     v_raw = float(encoder_results["test_voxel_size_raw"][i].detach().cpu().item())
                     bbox_diag = float(encoder_results["test_bbox_diag"][i].detach().cpu().item())
                     v_min = 0.0001 * bbox_diag
-                    v_max = 0.0003 * bbox_diag
+                    v_max = 0.0002 * bbox_diag
                     print(
                         f"[VoxelSize] scene={scene} "
                         f"v={voxel_size:.8f} v_raw={v_raw:.8f} "
@@ -687,10 +717,11 @@ class ModelWrapper(LightningModule):
                 )
             rendered_num_gaussians = count_gaussians(gaussians)
             gaussian_retention_ratio = (
-                fused_num_gaussians / float(rendered_num_gaussians)
-                if rendered_num_gaussians > 0
+                float(rendered_num_gaussians) / fused_num_gaussians
+                if np.isfinite(fused_num_gaussians) and fused_num_gaussians > 0
                 else float("nan")
             )
+            gs_ratio = to_scalar_mean(encoder_results.get("gs_ratio", None))
             
         with self.benchmarker.time("decoder", num_calls=v):
             if not isinstance(gaussians, list):
@@ -732,6 +763,7 @@ class ModelWrapper(LightningModule):
         # Save images.
         (scene,) = batch["scene"]
         print(f'processing {scene}')
+        print(f"gs_ratio({scene}): {gs_ratio:.6f}")
         print(f"gaussian_retention_ratio({scene}): {gaussian_retention_ratio:.6f}")
         self.test_scene_list.append(scene)
         name = get_cfg()["wandb"]["name"]
@@ -812,6 +844,7 @@ class ModelWrapper(LightningModule):
             self.benchmarker.store('fused_num_gaussians', fused_num_gaussians)
             self.benchmarker.store('rendered_num_gaussians', rendered_num_gaussians)
             self.benchmarker.store('gaussian_retention_ratio', gaussian_retention_ratio)
+            self.benchmarker.store('gs_ratio', gs_ratio)
             self.test_fvs_list.append(False)
         else:
             length = batch["target"]["index"][0].shape[0]
@@ -831,6 +864,7 @@ class ModelWrapper(LightningModule):
             self.benchmarker.store('fused_num_gaussians', fused_num_gaussians)
             self.benchmarker.store('rendered_num_gaussians', rendered_num_gaussians)
             self.benchmarker.store('gaussian_retention_ratio', gaussian_retention_ratio)
+            self.benchmarker.store('gs_ratio', gs_ratio)
             self.test_fvs_list.append(True)
         if self.encoder_visualizer is not None:
             for k, image in self.encoder_visualizer.visualize(
@@ -860,6 +894,7 @@ class ModelWrapper(LightningModule):
                                 self.benchmarker.benchmarks['depth_rel_diff'][i],
                                 self.benchmarker.benchmarks['depth_delta_25'][i],
                                 self.benchmarker.benchmarks['depth_delta_10'][i],
+                                self.benchmarker.benchmarks['gs_ratio'][i],
                                 self.benchmarker.benchmarks['gaussian_retention_ratio'][i])
             else:
                 print(self.test_scene_list[i], self.benchmarker.benchmarks['psnr_inter'][i], 
@@ -869,6 +904,7 @@ class ModelWrapper(LightningModule):
                                 self.benchmarker.benchmarks['depth_rel_diff'][i],
                                 self.benchmarker.benchmarks['depth_delta_25'][i],
                                 self.benchmarker.benchmarks['depth_delta_10'][i],
+                                self.benchmarker.benchmarks['gs_ratio'][i],
                                 self.benchmarker.benchmarks['gaussian_retention_ratio'][i])
             if np.isnan(self.benchmarker.benchmarks['depth_abs_diff'][i]) or np.isnan(self.benchmarker.benchmarks['depth_rel_diff'][i]) or np.isnan(self.benchmarker.benchmarks['depth_delta_25'][i]) or np.isnan(self.benchmarker.benchmarks['depth_delta_10'][i]):
                 nan_scenes.append(self.test_scene_list[i])
@@ -919,12 +955,14 @@ class ModelWrapper(LightningModule):
         )
         gaussian_retention_ratio_avg = self.benchmarker.benchmarks.get(
             "gaussian_retention_ratio_avg",
-            self.benchmarker.benchmarks["fused_num_gaussians_avg"] / rendered_num_gaussians_avg
-            if np.isfinite(rendered_num_gaussians_avg) and rendered_num_gaussians_avg > 0
+            rendered_num_gaussians_avg / self.benchmarker.benchmarks["fused_num_gaussians_avg"]
+            if np.isfinite(self.benchmarker.benchmarks["fused_num_gaussians_avg"])
+            and self.benchmarker.benchmarks["fused_num_gaussians_avg"] > 0
             else float("nan"),
         )
         log_metric('fused_num_gaussians_avg', self.benchmarker.benchmarks["fused_num_gaussians_avg"])
         log_metric('rendered_num_gaussians_avg', rendered_num_gaussians_avg)
+        log_metric('gs_ratio_avg', self.benchmarker.benchmarks.get("gs_ratio_avg", float("nan")))
         log_metric('gaussian_retention_ratio_avg', gaussian_retention_ratio_avg)
         log_metric('peak_memory_gb', peak_memory_gb)
         log_metric('mean_encoder_time', mean_encoder_time, decimals=6)
@@ -987,16 +1025,19 @@ class ModelWrapper(LightningModule):
         )
         rendered_num_gaussians = float(count_gaussians(gaussians_probabilistic))
         gaussian_retention_ratio = (
-            fused_num_gaussians / rendered_num_gaussians
-            if rendered_num_gaussians > 0
+            rendered_num_gaussians / fused_num_gaussians
+            if np.isfinite(fused_num_gaussians) and fused_num_gaussians > 0
             else float("nan")
         )
+        gs_ratio = to_scalar_mean(encoder_probabilistic_results.get("gs_ratio", None))
         self.val_fused_num_gaussians.append(fused_num_gaussians)
         self.val_rendered_num_gaussians.append(rendered_num_gaussians)
         self.val_gaussian_retention_ratio.append(gaussian_retention_ratio)
+        self.val_gs_ratio.append(gs_ratio)
         self.log("val/fused_num_gaussians", fused_num_gaussians)
         self.log("val/rendered_num_gaussians", rendered_num_gaussians)
         self.log("val/gaussian_retention_ratio", gaussian_retention_ratio)
+        self.log("val/gs_ratio", gs_ratio)
         if not isinstance(gaussians_probabilistic, list):
             output_probabilistic = self.decoder.forward(
                 gaussians_probabilistic,
@@ -1122,7 +1163,8 @@ class ModelWrapper(LightningModule):
             fused_avg = float(np.nanmean(np.asarray(self.val_fused_num_gaussians, dtype=float))) if len(self.val_fused_num_gaussians) > 0 else float("nan")
             rendered_avg = float(np.nanmean(np.asarray(self.val_rendered_num_gaussians, dtype=float))) if len(self.val_rendered_num_gaussians) > 0 else float("nan")
             ratio_avg = float(np.nanmean(np.asarray(self.val_gaussian_retention_ratio, dtype=float))) if len(self.val_gaussian_retention_ratio) > 0 else float("nan")
-            line = line + f'fused_num_gaussians_avg={fused_avg} rendered_num_gaussians_avg={rendered_avg} gaussian_retention_ratio_avg={ratio_avg}'
+            gs_ratio_avg = float(np.nanmean(np.asarray(self.val_gs_ratio, dtype=float))) if len(self.val_gs_ratio) > 0 else float("nan")
+            line = line + f'fused_num_gaussians_avg={fused_avg} rendered_num_gaussians_avg={rendered_avg} gaussian_retention_ratio_avg={ratio_avg} gs_ratio_avg={gs_ratio_avg}'
             f.write(line + '\n')
             print(line)
         for metric in ['psnr', 'lpips', 'ssim']:
@@ -1131,6 +1173,7 @@ class ModelWrapper(LightningModule):
         self.val_fused_num_gaussians = []
         self.val_rendered_num_gaussians = []
         self.val_gaussian_retention_ratio = []
+        self.val_gs_ratio = []
 
     @rank_zero_only
     def render_video_wobble(self, batch: BatchedExample) -> None:

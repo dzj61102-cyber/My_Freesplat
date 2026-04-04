@@ -322,14 +322,14 @@ class EncoderFreeSplat(Encoder[EncoderFreeSplatCfg]):
         eigvals = torch.linalg.eigvalsh(covariances).clamp_min(0.0)
         scale_proxy = eigvals.prod(dim=-1).clamp_min(1e-24).pow(1.0 / 6.0)
         m = torch.median(scale_proxy)
-        v_raw = 2.5 * m
+        v_raw = 2 * m
 
-        # Step 2: L = ||mu_max - mu_min||_2, 并限制 v 到 [0.002L, 0.02L]
+        # Step 2: L = ||mu_max - mu_min||_2, 并限制 v 上下限
         mu_max = means.max(dim=0).values
         mu_min = means.min(dim=0).values
         bbox_diag = torch.linalg.norm(mu_max - mu_min, ord=2)
         v_min = 0.0001 * bbox_diag
-        v_max = 0.0003 * bbox_diag
+        v_max = 0.0002 * bbox_diag
         v_limited = torch.clamp(v_raw, min=v_min, max=v_max)
 
         # 退化盒子（L≈0）时，保留非零 v_raw，避免后续体素划分除零。

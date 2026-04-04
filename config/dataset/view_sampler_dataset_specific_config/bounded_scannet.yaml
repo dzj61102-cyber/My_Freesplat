@@ -5,7 +5,7 @@ dataset:
     min_distance_between_context_views: 25
     max_distance_between_context_views: 25
     min_distance_to_context_views: 0
-    warm_up_steps: 15_000
+    warm_up_steps: 7_500
     initial_min_distance_between_context_views: 15
     initial_max_distance_between_context_views: 25
     num_target_views: 4
