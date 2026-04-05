@@ -43,8 +43,8 @@ optimizer:
   lr_importance_head: 1.e-4
   lr_gru: 5.e-5
   lr_to_gaussians: 5.e-5
-  lr_depth_decoder: 2.e-5
-  lr_high_resolution_skip0: 2.e-5
+  lr_depth_decoder: 5.e-6
+  lr_high_resolution_skip0: 5.e-6
 
 checkpointing:
   load: null
@@ -63,11 +63,11 @@ train:
 
 test:
   output_path: outputs/test
-  save_ratio: 1.0
+  save_ratio: 0.8
   pruning_mode: 0
-  save_context_change_maps: true
-  save_fused_change_histogram: true
-
+  save_context_change_maps: false
+  save_fused_change_histogram: false
+  save_cur_gaussians_now_ch0_histogram: false
 seed: 111123
 
 strict: true

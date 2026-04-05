@@ -386,6 +386,45 @@ def save_teacher_histogram(
     fig.savefig(scene_dir / f"sample_{sample_idx:0>3}.png", dpi=220)
     plt.close(fig)
 
+
+def save_cur_gaussians_now_ch0_histogram(
+    ch0_values,
+    output_root: Path,
+    scene: str,
+    sample_idx: int = 0,
+):
+    if ch0_values is None:
+        return
+    if isinstance(ch0_values, list):
+        if len(ch0_values) == 0:
+            return
+        if sample_idx >= len(ch0_values):
+            return
+        ch0_values = ch0_values[sample_idx]
+
+    if not torch.is_tensor(ch0_values):
+        return
+    if ch0_values.ndim == 2:
+        ch0_values = ch0_values[0]
+
+    values = ch0_values.detach().float().cpu()
+    values = values[torch.isfinite(values)]
+    if values.numel() == 0:
+        return
+
+    scene_dir = output_root / scene / "cur_gaussians_now_ch0_hist"
+    scene_dir.mkdir(parents=True, exist_ok=True)
+
+    values_np = values.numpy()
+    fig, ax = plt.subplots(figsize=(8, 5))
+    ax.hist(values_np, bins=100, color="#2563EB", edgecolor="black", linewidth=0.2)
+    ax.set_title(f"cur_gaussians_now Channel-0 Histogram ({scene})")
+    ax.set_xlabel("Channel-0 Value")
+    ax.set_ylabel("Count")
+    fig.tight_layout()
+    fig.savefig(scene_dir / f"sample_{sample_idx:0>3}.png", dpi=220)
+    plt.close(fig)
+
 # 获取剪枝分数，输入的importance_scores是学习所得分数
 def compute_pruning_scores(
     gaussians: Gaussians,
@@ -608,9 +647,11 @@ class TestCfg:
     # 0=不剪枝，1=opacity，2=opacity*scale_proxy，3=learned importance score。
     pruning_mode: int = 0
     # 是否在测试时保存每个输入视角的变化值图。
-    save_context_change_maps: bool = True
+    save_context_change_maps: bool = False
     # 是否在测试时保存融合后全局高斯变化值直方图。
-    save_fused_change_histogram: bool = True
+    save_fused_change_histogram: bool = False
+    # 是否在测试时保存 cur_gaussians_now 第0通道值直方图。
+    save_cur_gaussians_now_ch0_histogram: bool = False
 
 
 @dataclass
@@ -811,24 +852,24 @@ class ModelWrapper(LightningModule):
             total_loss = total_loss + loss
             self.losses_log[loss_fn.name] = self.losses_log.get(loss_fn.name, [])
             self.losses_log[loss_fn.name].append(loss)
-        if "prune_budget_loss" in encoder_results and "prune_bin_loss" in encoder_results:
+        if "prune_budget_loss" in encoder_results and "prune_mod_loss" in encoder_results:
             # 预算感知剪枝附加损失（由 encoder 计算后回传）：
             # prune_budget_loss: 约束 mean(gate) 接近 keep_ratio(rho)
-            # prune_bin_loss:    约束 gate 向 0/1 靠拢，便于后续 hard 剪枝
+            # prune_mod_loss:    调制正则，约束 tanh 后重要性分数的幅值
             prune_budget_loss = encoder_results["prune_budget_loss"]
-            prune_bin_loss = encoder_results["prune_bin_loss"]
+            prune_mod_loss = encoder_results["prune_mod_loss"]
             # 总损失 = 主渲染损失 + 剪枝正则项。
-            total_loss = total_loss + prune_budget_loss + prune_bin_loss
+            total_loss = total_loss + prune_budget_loss + prune_mod_loss
             if "prune_bce_loss" in encoder_results:
                 total_loss = total_loss + encoder_results["prune_bce_loss"]
             self.log("loss/prune_budget", prune_budget_loss, on_step=True, on_epoch=True, sync_dist=True, logger=True)
-            self.log("loss/prune_bin", prune_bin_loss, on_step=True, on_epoch=True, sync_dist=True, logger=True)
+            self.log("loss/prune_mod", prune_mod_loss, on_step=True, on_epoch=True, sync_dist=True, logger=True)
             if "prune_bce_loss" in encoder_results:
                 self.log("loss/prune_bce", encoder_results["prune_bce_loss"], on_step=True, on_epoch=True, sync_dist=True, logger=True)
             self.losses_log["prune_budget"] = self.losses_log.get("prune_budget", [])
             self.losses_log["prune_budget"].append(prune_budget_loss)
-            self.losses_log["prune_bin"] = self.losses_log.get("prune_bin", [])
-            self.losses_log["prune_bin"].append(prune_bin_loss)
+            self.losses_log["prune_mod"] = self.losses_log.get("prune_mod", [])
+            self.losses_log["prune_mod"].append(prune_mod_loss)
             if "prune_bce_loss" in encoder_results:
                 self.losses_log["prune_bce"] = self.losses_log.get("prune_bce", [])
                 self.losses_log["prune_bce"].append(encoder_results["prune_bce_loss"])
@@ -918,11 +959,7 @@ class ModelWrapper(LightningModule):
             raise ValueError(
                 f"test.save_ratio must be in (0, 1], got {self.test_cfg.save_ratio}"
             )
-        # 推理阶段支持 4 种模式，mode=3 为 learned importance 硬剪枝。
-        if self.test_cfg.pruning_mode not in (0, 1, 2, 3):
-            raise ValueError(
-                f"test.pruning_mode must be one of [0, 1, 2, 3], got {self.test_cfg.pruning_mode}"
-            )
+        # 当前推理路径统一按不透明度做 top-k，pruning_mode 不参与该路径。
 
         b, v, _, h, w = batch["target"]["image"].shape
         assert b == 1
@@ -939,29 +976,16 @@ class ModelWrapper(LightningModule):
                 export_ply=self.encoder_visualizer.cfg.export_ply,
             )
             gaussians_full = encoder_results['gaussians']
-
-            # encoder 输出的 learned importance 分数（mode=3 使用）。
+            # encoder 输出的 learned importance 分数（用于 mode=3 可视化）。
             importance_scores = encoder_results.get("gaussians_importance_scores", None)
-            if self.test_cfg.pruning_mode == 3:
-                # mode=3 时优先使用 test.save_ratio；
-                # 若用户保持默认 1.0，则回退到训练预算 prune_keep_ratio。
-                keep_ratio = self.test_cfg.save_ratio
-                if keep_ratio >= 1.0 and "prune_keep_ratio" in encoder_results:
-                    keep_ratio = float(encoder_results["prune_keep_ratio"])
-                # 采用训练最小温度 tau_end 做门控：m=sigmoid(s/tau_end)。
-                # 然后以 new_opacity=opacity*m 做 top-k，并以 new_opacity 渲染。
-                tau_end = get_pruning_tau_end(self.encoder)
-                gaussians = prune_gaussians_mode3_with_gated_opacity(
-                    gaussians_full,
-                    keep_ratio,
-                    importance_scores=importance_scores,
-                    tau=tau_end,
-                )
-            else:
-                # mode=1/2：启发式剪枝路径。
-                gaussians = prune_gaussians_container(
-                    gaussians_full, self.test_cfg.save_ratio, self.test_cfg.pruning_mode
-                )
+
+            # 测试阶段统一：先按不透明度做 top-k，再渲染。
+            keep_ratio = self.test_cfg.save_ratio
+            if keep_ratio >= 1.0 and "prune_keep_ratio" in encoder_results:
+                keep_ratio = float(encoder_results["prune_keep_ratio"])
+            gaussians = prune_gaussians_container(
+                gaussians_full, keep_ratio, pruning_mode=1
+            )
             rendered_num_gaussians = count_gaussians(gaussians)
         # 计算解码时间
         with self.benchmarker.time("decoder", num_calls=v):
@@ -1050,6 +1074,18 @@ class ModelWrapper(LightningModule):
                     denom = float(max(fused_changes.shape[-1] - 1, 1))
                     teacher = ranks / denom
                     save_teacher_histogram(teacher, path, scene, sample_idx=0)
+        if self.test_cfg.save_cur_gaussians_now_ch0_histogram:
+            ch0_values = encoder_results.get("cur_gaussians_now_ch0", None)
+            if isinstance(ch0_values, list):
+                for sample_idx in range(len(ch0_values)):
+                    save_cur_gaussians_now_ch0_histogram(
+                        ch0_values,
+                        path,
+                        scene,
+                        sample_idx=sample_idx,
+                    )
+            else:
+                save_cur_gaussians_now_ch0_histogram(ch0_values, path, scene, sample_idx=0)
         abs_diff, rel_diff, delta_25, delta_10 = depth_render_metrics(output, batch)
         print(f'abs_diff: {abs_diff}, rel_diff: {rel_diff}, delta_25: {delta_25}, delta_10: {delta_10}')
         self.benchmarker.store('depth_abs_diff', float(abs_diff.detach().cpu().numpy()))
@@ -1271,17 +1307,14 @@ class ModelWrapper(LightningModule):
         )
         gaussians_probabilistic_full = encoder_probabilistic_results['gaussians']
 
-        # 验证阶段默认固定 mode=3，并与 test_step 的 mode=3 路径保持一致。
-        importance_scores = encoder_probabilistic_results.get("gaussians_importance_scores", None)
+        # 验证阶段：先按不透明度做 top-k，再渲染。
         keep_ratio = self.test_cfg.save_ratio
         if keep_ratio >= 1.0 and "prune_keep_ratio" in encoder_probabilistic_results:
             keep_ratio = float(encoder_probabilistic_results["prune_keep_ratio"])
-        tau_end = get_pruning_tau_end(self.encoder)
-        gaussians_probabilistic = prune_gaussians_mode3_with_gated_opacity(
+        gaussians_probabilistic = prune_gaussians_container(
             gaussians_probabilistic_full,
             keep_ratio,
-            importance_scores=importance_scores,
-            tau=tau_end,
+            pruning_mode=1,
         )
         if not isinstance(gaussians_probabilistic, list):
             output_probabilistic = self.decoder.forward(

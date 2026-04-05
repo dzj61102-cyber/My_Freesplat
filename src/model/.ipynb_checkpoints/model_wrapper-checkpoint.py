@@ -36,6 +36,7 @@ from ..visualization.validation_in_3d import render_cameras, render_projections
 from .decoder.decoder import Decoder, DepthRenderingMode, DecoderOutput
 from .encoder import Encoder
 from .encoder.encoder_freesplat import UseDepthMode
+from .types import Gaussians
 from .encoder.visualization.encoder_visualizer import EncoderVisualizer
 
 
@@ -84,6 +85,50 @@ def convert_array_to_pil(depth_map, no_text=False):
 
     return colormapped_im
 
+
+def convert_scalar_map_to_pil(value_map, no_text=False, cmap="magma"):
+    value_map = np.asarray(value_map)
+    if value_map.ndim == 3 and value_map.shape[0] == 1:
+        value_map = value_map[0]
+    elif value_map.ndim == 3 and value_map.shape[-1] == 1:
+        value_map = value_map[..., 0]
+    elif value_map.ndim != 2:
+        raise ValueError(f"Expected scalar map with 2 dims, got shape {value_map.shape}")
+
+    mask = np.isfinite(value_map)
+    if not np.any(mask):
+        return np.full((*value_map.shape, 3), 255, dtype=np.uint8)
+
+    vmin = np.percentile(value_map[mask], 5)
+    vmax = np.percentile(value_map[mask], 95)
+    if vmax <= vmin:
+        vmax = vmin + 1e-6
+
+    normalizer = mpl.colors.Normalize(vmin=vmin, vmax=vmax)
+    cmap_obj = plt.get_cmap(cmap)
+    masked_map = np.ma.array(value_map, mask=~mask)
+
+    h, w = value_map.shape
+    fig_w = max(4.0, w / 160.0)
+    fig_h = max(3.0, h / 160.0)
+    fig, ax = plt.subplots(figsize=(fig_w, fig_h), dpi=150)
+    im = ax.imshow(masked_map, cmap=cmap_obj, norm=normalizer)
+    ax.set_axis_off()
+    cbar = fig.colorbar(im, ax=ax, fraction=0.046, pad=0.02)
+    cbar.ax.tick_params(labelsize=8)
+    cbar.set_label("Change Value", fontsize=9)
+    if not no_text:
+        ax.set_title(
+            f"min={float(value_map[mask].min()):.4f}, max={float(value_map[mask].max()):.4f}",
+            fontsize=10,
+        )
+    fig.tight_layout(pad=0.1)
+    fig.canvas.draw()
+    rgba = np.asarray(fig.canvas.buffer_rgba())
+    rgb = rgba[..., :3].copy()
+    plt.close(fig)
+    return rgb
+
 # Compute RGB metrics at novel views.
 def compute_metrics(rgb_gt, rgb):
     rgb = rgb.clip(min=0, max=1)
@@ -100,79 +145,423 @@ def compute_metrics(rgb_gt, rgb):
     print('psnr:', psnr, 'ssim:', ssim, 'lpips:', lpips, 'num:', num)
     return psnr, lpips, ssim, num
 
-
-def save_gaussian_opacity_visualizations(
+# 可视化代码，剪枝前后直方图和3d图
+def save_gaussian_metric_visualizations(
     gaussians,
     output_root: Path,
     scene: str,
+    pruning_mode: int,
+    importance_scores=None,
     max_points_3d: int = 80000,
+    suffix: str = "",
 ):
+    # suffix 用于区分“剪枝前/剪枝后”输出文件名，例如 "_pruned"。
+    title_suffix = " (Pruned)" if suffix == "_pruned" else ""
     if gaussians is None:
         return
     if isinstance(gaussians, list):
         if len(gaussians) == 0:
             return
         gaussians = gaussians[0]
+    if isinstance(importance_scores, list):
+        if len(importance_scores) == 0:
+            importance_scores = None
+        else:
+            # 与 gaussians 一致：当前函数只绘制第 0 个样本。
+            importance_scores = importance_scores[0]
 
     means = gaussians.means
     opacities = gaussians.opacities
+    covariances = gaussians.covariances
     if means.ndim == 3:
         means = means[0]
     if opacities.ndim == 2:
         opacities = opacities[0]
+    if covariances.ndim == 4:
+        covariances = covariances[0]
+    if importance_scores is not None and importance_scores.ndim == 2:
+        # [B, G] -> [G]，与 means/opacities 对齐。
+        importance_scores = importance_scores[0]
 
     means = means.detach().float().cpu()
     opacities = opacities.detach().float().cpu()
+    covariances = covariances.detach().float().cpu()
     valid = torch.isfinite(means).all(dim=1) & torch.isfinite(opacities)
+    if pruning_mode == 2:
+        valid = valid & torch.isfinite(covariances).flatten(1).all(dim=1)
     if valid.sum().item() == 0:
         return
     means = means[valid]
     opacities = opacities[valid]
+    covariances = covariances[valid]
+
+    if pruning_mode in (0, 1):
+        # mode 0/1 统一可视化 opacity（mode 1 也是按 opacity 剪枝）。
+        metric_values = opacities
+        metric_name = "Opacity"#图标题
+        metric_prefix = "opacity"#文件标题
+        color_min = 0.0
+        color_max = 1.0
+    elif pruning_mode == 2:
+        # mode 2: 启发式重要性分数 = opacity * scale_proxy。
+        # scale_proxy 由协方差特征值体积近似而来，反映“尺度贡献”。
+        eigvals = torch.linalg.eigvalsh(covariances).clamp_min(0.0)
+        scale_proxy = eigvals.prod(dim=-1).pow(1.0 / 6.0)
+        metric_values = opacities * scale_proxy
+        metric_name = "Opacity*Scale"
+        metric_prefix = "opacity_scale"
+        color_min = float(torch.quantile(metric_values, 0.01).item())
+        color_max = float(torch.quantile(metric_values, 0.99).item())
+        if color_max <= color_min:
+            color_max = color_min + 1e-6
+    elif pruning_mode == 3:
+        # mode 3: 预算感知 learned score 可视化。
+        # 若上游未提供 importance_scores，则回退到 opacity。
+        if importance_scores is None:
+            metric_values = opacities
+        else:
+            metric_values = importance_scores.detach().float().cpu()
+            if metric_values.ndim == 2:
+                metric_values = metric_values[0]
+        metric_values = metric_values[valid]
+        metric_name = "Learned Score"
+        metric_prefix = "learned_score"
+        color_min = float(torch.quantile(metric_values, 0.01).item())
+        color_max = float(torch.quantile(metric_values, 0.99).item())
+        if color_max <= color_min:
+            color_max = color_min + 1e-6
+    else:
+        raise ValueError(f"Unsupported pruning_mode: {pruning_mode}")
 
     scene_dir = output_root / scene
     scene_dir.mkdir(parents=True, exist_ok=True)
 
-    opacity_np = opacities.numpy()
+    metric_np = metric_values.numpy()
     fig, ax = plt.subplots(figsize=(8, 5))
-    ax.hist(opacity_np, bins=100, color="#3B82F6", edgecolor="black", linewidth=0.2)
-    ax.set_title(f"Global Gaussian Opacity Histogram ({scene})")
-    ax.set_xlabel("Opacity")
-    ax.set_ylabel("Count")
+    ax.hist(metric_np, bins=100, color="#3B82F6", edgecolor="black", linewidth=0.2)
+    if suffix == "":
+        top_levels = [0.8, 0.6, 0.4]
+        quantile_colors = ["#EF4444", "#F59E0B", "#10B981"]
+        ymax = ax.get_ylim()[1]
+        for top_p, c in zip(top_levels, quantile_colors):
+            qv = float(np.quantile(metric_np, 1.0 - top_p))
+            ax.axvline(qv, color=c, linestyle="--", linewidth=1.5, alpha=0.95)
+            ax.text(
+                qv,
+                ymax * 0.98,
+                f"Top{int(top_p * 100)}%={qv:.4f}",
+                color=c,
+                rotation=90,
+                va="top",
+                ha="right",
+                fontsize=8,
+            )
+    ax.set_title(f"Global Gaussian {metric_name} Histogram ({scene}){title_suffix}")
+    ax.set_xlabel(metric_name)
     fig.tight_layout()
-    fig.savefig(scene_dir / "gaussian_opacity_hist.png", dpi=220)
+    fig.savefig(scene_dir / f"gaussian_{metric_prefix}_hist{suffix}.png", dpi=220)
     plt.close(fig)
 
     n = means.shape[0]
     if n > max_points_3d:
         idx = torch.randperm(n)[:max_points_3d]
         means = means[idx]
-        opacities = opacities[idx]
+        metric_values = metric_values[idx]
 
     xyz = means.numpy()
-    opacity_np = opacities.numpy()
+    metric_np = metric_values.numpy()
+    high_contrast_cmap = mpl.colors.LinearSegmentedColormap.from_list(
+        "high_contrast_no_yellow",
+        [
+            "#0B1F8A",  # deep blue
+            "#1D4ED8",  # blue
+            "#06B6D4",  # cyan
+            "#10B981",  # green
+            "#F97316",  # orange
+            "#DC2626",  # red
+            "#7F1D1D",  # dark red
+        ],
+        N=256,
+    )
     fig = plt.figure(figsize=(9, 7))
     ax = fig.add_subplot(111, projection="3d")
     scatter = ax.scatter(
         xyz[:, 0],
         xyz[:, 1],
         xyz[:, 2],
-        c=opacity_np,
-        cmap="viridis",
+        c=metric_np,
+        cmap=high_contrast_cmap,
         s=1.2,
         alpha=0.9,
-        vmin=0.0,
-        vmax=1.0,
+        vmin=color_min,
+        vmax=color_max,
         linewidths=0.0,
     )
-    ax.set_title(f"Global Gaussian Opacity in 3D ({scene})")
+    ax.set_title(f"Global Gaussian {metric_name} in 3D ({scene}){title_suffix}")
     ax.set_xlabel("X")
     ax.set_ylabel("Y")
     ax.set_zlabel("Z")
     cbar = fig.colorbar(scatter, ax=ax, pad=0.08, shrink=0.75)
-    cbar.set_label("Opacity")
+    cbar.set_label(metric_name)
     fig.tight_layout()
-    fig.savefig(scene_dir / "gaussian_opacity_3d.png", dpi=260)
+    fig.savefig(scene_dir / f"gaussian_{metric_prefix}_3d{suffix}.png", dpi=260)
     plt.close(fig)
+
+
+def save_fused_change_histogram(
+    fused_changes,
+    output_root: Path,
+    scene: str,
+    sample_idx: int = 0,
+):
+    if fused_changes is None:
+        return
+    if isinstance(fused_changes, list):
+        if len(fused_changes) == 0:
+            return
+        if sample_idx >= len(fused_changes):
+            return
+        fused_changes = fused_changes[sample_idx]
+
+    if not torch.is_tensor(fused_changes):
+        return
+    if fused_changes.ndim == 2:
+        # [B, G] -> [G]
+        fused_changes = fused_changes[0]
+
+    values = fused_changes.detach().float().cpu()
+    values = values[torch.isfinite(values)]
+    if values.numel() == 0:
+        return
+
+    scene_dir = output_root / scene / "fused_change_hist"
+    scene_dir.mkdir(parents=True, exist_ok=True)
+
+    values_np = values.numpy()
+    fig, ax = plt.subplots(figsize=(8, 5))
+    ax.hist(values_np, bins=100, color="#22C55E", edgecolor="black", linewidth=0.2)
+    ax.set_title(f"Fused Global Change Histogram ({scene})")
+    ax.set_xlabel("Fused Change Value")
+    ax.set_ylabel("Count")
+    fig.tight_layout()
+    fig.savefig(scene_dir / f"sample_{sample_idx:0>3}.png", dpi=220)
+    plt.close(fig)
+
+
+def save_teacher_histogram(
+    teacher_values,
+    output_root: Path,
+    scene: str,
+    sample_idx: int = 0,
+):
+    if teacher_values is None:
+        return
+    if isinstance(teacher_values, list):
+        if len(teacher_values) == 0:
+            return
+        if sample_idx >= len(teacher_values):
+            return
+        teacher_values = teacher_values[sample_idx]
+
+    if not torch.is_tensor(teacher_values):
+        return
+    if teacher_values.ndim == 2:
+        teacher_values = teacher_values[0]
+
+    values = teacher_values.detach().float().cpu()
+    values = values[torch.isfinite(values)]
+    if values.numel() == 0:
+        return
+
+    scene_dir = output_root / scene / "teacher_hist"
+    scene_dir.mkdir(parents=True, exist_ok=True)
+
+    values_np = values.numpy()
+    fig, ax = plt.subplots(figsize=(8, 5))
+    ax.hist(values_np, bins=100, color="#F97316", edgecolor="black", linewidth=0.2)
+    ax.set_title(f"Teacher Histogram ({scene})")
+    ax.set_xlabel("Teacher Value")
+    ax.set_ylabel("Count")
+    fig.tight_layout()
+    fig.savefig(scene_dir / f"sample_{sample_idx:0>3}.png", dpi=220)
+    plt.close(fig)
+
+# 获取剪枝分数，输入的importance_scores是学习所得分数
+def compute_pruning_scores(
+    gaussians: Gaussians,
+    pruning_mode: int,
+    importance_scores: Float[Tensor, "batch gaussian"] | None = None,
+) -> Float[Tensor, "batch gaussian"]:
+    # 统一剪枝打分入口：
+    # mode=1 -> opacity；mode=2 -> opacity*scale；mode=3 -> learned score。
+    if pruning_mode == 1:
+        return gaussians.opacities
+    if pruning_mode == 2:
+        # eigvals shape: [batch, gaussian, 3]
+        eigvals = torch.linalg.eigvalsh(gaussians.covariances)
+        eigvals = eigvals.clamp_min(0.0)
+        scale_proxy = eigvals.prod(dim=-1).pow(1.0 / 6.0)
+        return gaussians.opacities * scale_proxy
+    if pruning_mode == 3:
+        # learned 剪枝模式必须显式提供 importance_scores。
+        if importance_scores is None:
+            raise ValueError("importance_scores is required when pruning_mode == 3")
+        return importance_scores
+    raise ValueError(f"Unsupported pruning_mode: {pruning_mode}")
+
+# 核心剪枝函数，基于分数做 hard top-k 剪枝，保证所有高斯属性同步裁剪。
+def prune_gaussians(
+    gaussians: Gaussians,
+    save_ratio: float,
+    pruning_mode: int,
+    importance_scores: Float[Tensor, "batch gaussian"] | None = None,
+) -> Gaussians:
+    if pruning_mode == 0 or save_ratio >= 1.0:
+        # mode=0 或保留率=1 时，不做剪枝。
+        return gaussians
+
+    opacities = gaussians.opacities
+    b, g = opacities.shape
+    # 采用 floor(save_ratio * G)，与预算定义 K=floor(rho*M) 保持一致。
+    # 同时保证至少保留 1 个高斯。
+    keep = max(1, int(np.floor(g * save_ratio)))
+    # 计算每个高斯的剪枝分数 [B, G]。
+    scores = compute_pruning_scores(gaussians, pruning_mode, importance_scores)
+    # 每个 batch 独立取 top-k 索引 [B, K]。
+    topk = torch.topk(scores, k=keep, dim=1, largest=True).indices
+
+    # 按相同 top-k 索引裁剪全部字段，维持几何/外观/opacity 一致性。
+    means = torch.stack(
+        [gaussians.means[i].index_select(0, topk[i]) for i in range(b)], dim=0
+    )
+    covariances = torch.stack(
+        [gaussians.covariances[i].index_select(0, topk[i]) for i in range(b)], dim=0
+    )
+    harmonics = torch.stack(
+        [gaussians.harmonics[i].index_select(0, topk[i]) for i in range(b)], dim=0
+    )
+    opacities = torch.stack(
+        [gaussians.opacities[i].index_select(0, topk[i]) for i in range(b)], dim=0
+    )
+    return Gaussians(means, covariances, harmonics, opacities)
+
+
+def prune_gaussians_container(
+    gaussians,
+    save_ratio: float,
+    pruning_mode: int,
+    importance_scores=None,
+):
+    # 兼容 Gaussians 与 list[Gaussians] 两种输入。
+    if pruning_mode == 0 or save_ratio >= 1.0:
+        return gaussians
+    if isinstance(gaussians, list):
+        # list 场景下，importance_scores 也按样本一一对齐。
+        return [
+            prune_gaussians(
+                gs,
+                save_ratio,
+                pruning_mode,
+                None if importance_scores is None else importance_scores[i],
+            )
+            for i, gs in enumerate(gaussians)
+        ]
+    return prune_gaussians(gaussians, save_ratio, pruning_mode, importance_scores)
+
+
+def prune_gaussians_mode3_with_gated_opacity(
+    gaussians,
+    save_ratio: float,
+    importance_scores,
+    tau: float = 0.2,
+):
+    # mode=3 测试/验证路径：
+    # 1) m = sigmoid(s / tau)
+    # 2) new_opacity = old_opacity * m
+    # 3) 按 new_opacity 做 top-k(keep_ratio) 剪枝
+    # 4) 用 new_opacity 渲染
+    if importance_scores is None:
+        raise ValueError("importance_scores is required for mode=3 gated pruning")
+
+    tau = max(float(tau), 1e-6)
+
+    def _prune_one(gs: Gaussians, score: Tensor) -> Gaussians:
+        if score.ndim == 1:
+            score = score.unsqueeze(0)
+        if score.ndim != 2:
+            raise ValueError(
+                f"importance score must be 2D [B, G] or 1D [G], got shape {tuple(score.shape)}"
+            )
+
+        if score.shape[-1] != gs.opacities.shape[-1]:
+            raise ValueError(
+                "importance score and gaussian opacities mismatch: "
+                f"{tuple(score.shape)} vs {tuple(gs.opacities.shape)}"
+            )
+        if score.shape[0] != gs.opacities.shape[0]:
+            if score.shape[0] == 1:
+                score = score.expand(gs.opacities.shape[0], -1)
+            else:
+                raise ValueError(
+                    "importance score batch mismatch: "
+                    f"{tuple(score.shape)} vs {tuple(gs.opacities.shape)}"
+                )
+
+        gates = torch.sigmoid(score / tau).to(dtype=gs.opacities.dtype)
+        gated_gaussians = Gaussians(
+            gs.means,
+            gs.covariances,
+            gs.harmonics,
+            gs.opacities * gates,
+        )
+        return prune_gaussians(
+            gated_gaussians,
+            save_ratio=save_ratio,
+            pruning_mode=1,
+            importance_scores=None,
+        )
+
+    if isinstance(gaussians, list):
+        if isinstance(importance_scores, list):
+            score_list = importance_scores
+        elif torch.is_tensor(importance_scores) and importance_scores.ndim >= 2:
+            if importance_scores.shape[0] != len(gaussians):
+                raise ValueError(
+                    "importance_scores batch size does not match gaussians list length: "
+                    f"{importance_scores.shape[0]} vs {len(gaussians)}"
+                )
+            score_list = [importance_scores[i] for i in range(len(gaussians))]
+        else:
+            raise ValueError("importance_scores format is invalid for gaussians list")
+
+        if len(score_list) != len(gaussians):
+            raise ValueError(
+                f"importance_scores list length mismatch: {len(score_list)} vs {len(gaussians)}"
+            )
+        return [_prune_one(gs, score_list[i]) for i, gs in enumerate(gaussians)]
+
+    if isinstance(importance_scores, list):
+        if len(importance_scores) == 0:
+            raise ValueError("importance_scores list is empty")
+        importance_scores = importance_scores[0]
+    if not torch.is_tensor(importance_scores):
+        raise ValueError("importance_scores must be a Tensor for single Gaussians input")
+    return _prune_one(gaussians, importance_scores)
+
+
+def get_pruning_tau_end(encoder: nn.Module) -> float:
+    budget_cfg = getattr(getattr(encoder, "cfg", None), "budget_pruning", None)
+    if budget_cfg is None or not hasattr(budget_cfg, "tau_end"):
+        raise ValueError(
+            "Missing encoder.cfg.budget_pruning.tau_end for mode=3 inference pruning."
+        )
+    return float(budget_cfg.tau_end)
+
+
+def count_gaussians(gaussians) -> int:
+    if isinstance(gaussians, list):
+        return sum(int(gs.means.shape[1]) for gs in gaussians)
+    return int(gaussians.means.shape[1])
 
 # Compute Depth metrics at novel views.
 def depth_render_metrics(prediction, batch) -> Float[Tensor, ""]:
@@ -203,11 +592,25 @@ class OptimizerCfg:
     lr: float
     warm_up_steps: int
     cosine_lr: bool
+    lr_importance_head: float | None = None
+    lr_gru: float | None = None
+    lr_to_gaussians: float | None = None
+    lr_depth_decoder: float | None = None
+    lr_high_resolution_skip0: float | None = None
 
 
 @dataclass
 class TestCfg:
     output_path: Path
+    # 测试阶段保留比例（0,1]。当 mode=3 且该值为 1.0 时，会在 test_step 中回退到 encoder 返回的 prune_keep_ratio。
+    save_ratio: float = 1.0
+    # 剪枝模式：
+    # 0=不剪枝，1=opacity，2=opacity*scale_proxy，3=learned importance score。
+    pruning_mode: int = 0
+    # 是否在测试时保存每个输入视角的变化值图。
+    save_context_change_maps: bool = False
+    # 是否在测试时保存融合后全局高斯变化值直方图。
+    save_fused_change_histogram: bool = False
 
 
 @dataclass
@@ -216,6 +619,7 @@ class TrainCfg:
     load_depth: UseDepthMode | None
     extended_visualization: bool
     has_depth: bool = False
+    train_only_importance_head: bool = False #仅训练 Importance Head 开关配置项
 
 
 @runtime_checkable
@@ -271,11 +675,52 @@ class ModelWrapper(LightningModule):
         self.decoder = decoder
         self.data_shim = get_data_shim(self.encoder)
         self.losses = nn.ModuleList(losses)
+        self.trainable_param_count = 0
 
         # This is used for testing.
         self.benchmarker = Benchmarker()
 
         self.losses_log = {}
+        # 先全冻结，再仅解冻白名单模块（兼容 train_only_importance_head 旧开关名）
+        if self.train_cfg.train_only_importance_head:
+            for param in self.parameters():
+                param.requires_grad = False
+            modules_to_unfreeze: list[tuple[str, nn.Module | None]] = [
+                ("importance_head", getattr(self.encoder, "importance_head", None)),
+                ("gru", getattr(self.encoder, "gru", None)),
+                ("to_gaussians", getattr(self.encoder, "to_gaussians", None)),
+                ("depth_decoder", getattr(self.encoder, "depth_decoder", None)),
+            ]
+            high_resolution_skip = getattr(self.encoder, "high_resolution_skip", None)
+            if high_resolution_skip is not None and len(high_resolution_skip) > 0:
+                modules_to_unfreeze.append(("high_resolution_skip.0", high_resolution_skip[0]))
+            else:
+                modules_to_unfreeze.append(("high_resolution_skip.0", None))
+
+            missing_modules = [name for name, module in modules_to_unfreeze if module is None]
+            if missing_modules:
+                raise ValueError(
+                    "train.train_only_importance_head=true but encoder missing module(s): "
+                    + ", ".join(missing_modules)
+                )
+            for _, module in modules_to_unfreeze:
+                for param in module.parameters():
+                    param.requires_grad = True
+            # 打印可训练参数名预览   
+            trainable_names = [
+                name for name, param in self.named_parameters() if param.requires_grad
+            ]
+            preview_count = min(12, len(trainable_names))
+            print(
+                f"[FreezeCheck] train_only_importance_head=True, "
+                f"trainable_tensors={len(trainable_names)}"
+            )
+            for name in trainable_names[:preview_count]:
+                print(f"[FreezeCheck] trainable: {name}")
+            if len(trainable_names) > preview_count:
+                print(
+                    f"[FreezeCheck] ... and {len(trainable_names) - preview_count} more trainable tensors"
+                )
         self.loss_total = []
         self.metrics = {}
         for metric in ['psnr', 'lpips', 'ssim']:
@@ -360,11 +805,39 @@ class ModelWrapper(LightningModule):
 
         total_loss = 0
         for loss_fn in self.losses:
+            # 主渲染损失（如 MSE / LPIPS），由配置中的 loss 列表决定。
             loss = loss_fn.forward(output, batch, gaussians, encoder_results, self.global_step, output_dr)
             self.log(f"loss/{loss_fn.name}", loss, on_step=True, on_epoch=True, sync_dist=True, logger=True)
             total_loss = total_loss + loss
             self.losses_log[loss_fn.name] = self.losses_log.get(loss_fn.name, [])
             self.losses_log[loss_fn.name].append(loss)
+        if "prune_budget_loss" in encoder_results and "prune_bin_loss" in encoder_results:
+            # 预算感知剪枝附加损失（由 encoder 计算后回传）：
+            # prune_budget_loss: 约束 mean(gate) 接近 keep_ratio(rho)
+            # prune_bin_loss:    约束 gate 向 0/1 靠拢，便于后续 hard 剪枝
+            prune_budget_loss = encoder_results["prune_budget_loss"]
+            prune_bin_loss = encoder_results["prune_bin_loss"]
+            # 总损失 = 主渲染损失 + 剪枝正则项。
+            total_loss = total_loss + prune_budget_loss + prune_bin_loss
+            if "prune_bce_loss" in encoder_results:
+                total_loss = total_loss + encoder_results["prune_bce_loss"]
+            self.log("loss/prune_budget", prune_budget_loss, on_step=True, on_epoch=True, sync_dist=True, logger=True)
+            self.log("loss/prune_bin", prune_bin_loss, on_step=True, on_epoch=True, sync_dist=True, logger=True)
+            if "prune_bce_loss" in encoder_results:
+                self.log("loss/prune_bce", encoder_results["prune_bce_loss"], on_step=True, on_epoch=True, sync_dist=True, logger=True)
+            self.losses_log["prune_budget"] = self.losses_log.get("prune_budget", [])
+            self.losses_log["prune_budget"].append(prune_budget_loss)
+            self.losses_log["prune_bin"] = self.losses_log.get("prune_bin", [])
+            self.losses_log["prune_bin"].append(prune_bin_loss)
+            if "prune_bce_loss" in encoder_results:
+                self.losses_log["prune_bce"] = self.losses_log.get("prune_bce", [])
+                self.losses_log["prune_bce"].append(encoder_results["prune_bce_loss"])
+            if "prune_gate_ratio" in encoder_results:
+                # gate 平均激活率（可与 keep_ratio 对比观察预算约束是否生效）。
+                self.log("prune/gate_ratio", encoder_results["prune_gate_ratio"], on_step=True, on_epoch=True, sync_dist=True, logger=True)
+            if "prune_tau" in encoder_results:
+                # 当前温度 tau（退火过程监控）。
+                self.log("prune/tau", encoder_results["prune_tau"], on_step=True, on_epoch=True, sync_dist=True, logger=True)
         self.log("loss/total", total_loss, on_step=True, on_epoch=True, sync_dist=True, logger=True)
         self.loss_total.append(total_loss)
         context_indices = batch['context']['index'].tolist()
@@ -380,6 +853,54 @@ class ModelWrapper(LightningModule):
             if 'gs_ratio' in encoder_results:
                 to_print = to_print + f' gs_ratio = {torch.mean(torch.tensor(encoder_results["gs_ratio"])):.6f}'
             print(to_print)
+            # 训练循环中的梯度范数检查，关注解冻白名单模块和一个冻结参数的梯度。
+            if self.train_cfg.train_only_importance_head:
+                grad_stats = {}
+                module_refs: list[tuple[str, nn.Module | None]] = [
+                    ("importance_head", getattr(self.encoder, "importance_head", None)),
+                    ("gru", getattr(self.encoder, "gru", None)),
+                    ("to_gaussians", getattr(self.encoder, "to_gaussians", None)),
+                    ("depth_decoder", getattr(self.encoder, "depth_decoder", None)),
+                ]
+                high_resolution_skip = getattr(self.encoder, "high_resolution_skip", None)
+                module_refs.append(
+                    ("high_resolution_skip.0", high_resolution_skip[0] if high_resolution_skip is not None and len(high_resolution_skip) > 0 else None)
+                )
+                for module_name, module in module_refs:
+                    if module is None:
+                        grad_stats[module_name] = -1.0
+                        continue
+                    module_grads = [
+                        p.grad.detach().norm()
+                        for p in module.parameters()
+                        if p.grad is not None
+                    ]
+                    grad_stats[module_name] = (
+                        torch.stack(module_grads).mean().item() if len(module_grads) > 0 else -1.0
+                    )
+
+                grad_frozen_example = None
+                for name, param in self.named_parameters():
+                    if not param.requires_grad:
+                        if param.grad is None:
+                            grad_frozen_example = 0.0
+                        else:
+                            grad_frozen_example = float(param.grad.detach().norm().item())
+                        frozen_name = name
+                        break
+                if grad_frozen_example is None:
+                    frozen_name = "None"
+                    grad_frozen_example = -1.0
+                print(
+                    f"[FreezeCheck] step={self.global_step} "
+                    f"grad_importance_head_mean={grad_stats['importance_head']:.6e} "
+                    f"grad_gru_mean={grad_stats['gru']:.6e} "
+                    f"grad_to_gaussians_mean={grad_stats['to_gaussians']:.6e} "
+                    f"grad_depth_decoder_mean={grad_stats['depth_decoder']:.6e} "
+                    f"grad_high_resolution_skip0_mean={grad_stats['high_resolution_skip.0']:.6e} "
+                    f"frozen_example={frozen_name} "
+                    f"grad_norm={grad_frozen_example:.6e}"
+                )
             self.losses_log = {}
             self.loss_total = []
             
@@ -392,13 +913,23 @@ class ModelWrapper(LightningModule):
 
     def test_step(self, batch, batch_idx):
         batch: BatchedExample = self.data_shim(batch)
+        # keep_ratio（save_ratio）取值要求：必须在 (0,1]。
+        if not (0.0 < self.test_cfg.save_ratio <= 1.0):
+            raise ValueError(
+                f"test.save_ratio must be in (0, 1], got {self.test_cfg.save_ratio}"
+            )
+        # 推理阶段支持 4 种模式，mode=3 为 learned importance 硬剪枝。
+        if self.test_cfg.pruning_mode not in (0, 1, 2, 3):
+            raise ValueError(
+                f"test.pruning_mode must be one of [0, 1, 2, 3], got {self.test_cfg.pruning_mode}"
+            )
 
         b, v, _, h, w = batch["target"]["image"].shape
         assert b == 1
         if batch_idx % 100 == 0:
             print(f"Test step {batch_idx:0>6}.")
     
-        # Render Gaussians.
+        # Render Gaussians.计算编码时间
         with self.benchmarker.time("encoder"):
             encoder_results = self.encoder(
                 batch["context"],
@@ -407,8 +938,32 @@ class ModelWrapper(LightningModule):
                 is_testing=True,
                 export_ply=self.encoder_visualizer.cfg.export_ply,
             )
-            gaussians = encoder_results['gaussians']
-            
+            gaussians_full = encoder_results['gaussians']
+
+            # encoder 输出的 learned importance 分数（mode=3 使用）。
+            importance_scores = encoder_results.get("gaussians_importance_scores", None)
+            if self.test_cfg.pruning_mode == 3:
+                # mode=3 时优先使用 test.save_ratio；
+                # 若用户保持默认 1.0，则回退到训练预算 prune_keep_ratio。
+                keep_ratio = self.test_cfg.save_ratio
+                if keep_ratio >= 1.0 and "prune_keep_ratio" in encoder_results:
+                    keep_ratio = float(encoder_results["prune_keep_ratio"])
+                # 采用训练最小温度 tau_end 做门控：m=sigmoid(s/tau_end)。
+                # 然后以 new_opacity=opacity*m 做 top-k，并以 new_opacity 渲染。
+                tau_end = get_pruning_tau_end(self.encoder)
+                gaussians = prune_gaussians_mode3_with_gated_opacity(
+                    gaussians_full,
+                    keep_ratio,
+                    importance_scores=importance_scores,
+                    tau=tau_end,
+                )
+            else:
+                # mode=1/2：启发式剪枝路径。
+                gaussians = prune_gaussians_container(
+                    gaussians_full, self.test_cfg.save_ratio, self.test_cfg.pruning_mode
+                )
+            rendered_num_gaussians = count_gaussians(gaussians)
+        # 计算解码时间
         with self.benchmarker.time("decoder", num_calls=v):
             if not isinstance(gaussians, list):
                 output = self.decoder.forward(
@@ -452,7 +1007,49 @@ class ModelWrapper(LightningModule):
         self.test_scene_list.append(scene)
         name = get_cfg()["wandb"]["name"]
         path = self.test_cfg.output_path / name
-        save_gaussian_opacity_visualizations(encoder_results["gaussians"], path, scene)
+        save_gaussian_metric_visualizations(
+            gaussians_full,
+            path,
+            scene,
+            pruning_mode=self.test_cfg.pruning_mode,
+            importance_scores=importance_scores,
+            suffix="",
+        )
+        save_gaussian_metric_visualizations(
+            gaussians,
+            path,
+            scene,
+            pruning_mode=self.test_cfg.pruning_mode,
+            suffix="_pruned",
+        )
+        if self.test_cfg.save_fused_change_histogram:
+            fused_changes = encoder_results.get("gaussians_fused_changes", None)
+            if isinstance(fused_changes, list):
+                for sample_idx in range(len(fused_changes)):
+                    save_fused_change_histogram(
+                        fused_changes,
+                        path,
+                        scene,
+                        sample_idx=sample_idx,
+                    )
+                    change_i = fused_changes[sample_idx]
+                    if torch.is_tensor(change_i):
+                        ranks = torch.argsort(torch.argsort(change_i, dim=-1), dim=-1).to(change_i.dtype)
+                        denom = float(max(change_i.shape[-1] - 1, 1))
+                        teacher_i = ranks / denom
+                        save_teacher_histogram(
+                            teacher_i,
+                            path,
+                            scene,
+                            sample_idx=sample_idx,
+                        )
+            else:
+                save_fused_change_histogram(fused_changes, path, scene, sample_idx=0)
+                if torch.is_tensor(fused_changes):
+                    ranks = torch.argsort(torch.argsort(fused_changes, dim=-1), dim=-1).to(fused_changes.dtype)
+                    denom = float(max(fused_changes.shape[-1] - 1, 1))
+                    teacher = ranks / denom
+                    save_teacher_histogram(teacher, path, scene, sample_idx=0)
         abs_diff, rel_diff, delta_25, delta_10 = depth_render_metrics(output, batch)
         print(f'abs_diff: {abs_diff}, rel_diff: {rel_diff}, delta_25: {delta_25}, delta_10: {delta_10}')
         self.benchmarker.store('depth_abs_diff', float(abs_diff.detach().cpu().numpy()))
@@ -471,6 +1068,24 @@ class ModelWrapper(LightningModule):
         for i, index, fig in zip(range(len(batch["context"]["index"][0])), batch["context"]["index"][0], batch["context"]["image"][0]):
             length = len(encoder_results[f"depth_num0_s-1"][0])
             save_image(fig, path / scene / f"contexts/{index:0>6}.png")
+            if self.test_cfg.save_context_change_maps and "context_change_map_bv1hw" in encoder_results:
+                change_map = encoder_results["context_change_map_bv1hw"][0, i].cpu().numpy()
+                save_image(
+                    torch.from_numpy(convert_scalar_map_to_pil(change_map, no_text=True).transpose(2, 0, 1).astype(np.float32) / 255).to(batch["context"]["image"][0].device),
+                    path / scene / f"change_map/{index:0>6}.png",
+                )
+            # if self.test_cfg.save_context_change_maps and "context_change_map_photo_bv1hw" in encoder_results:
+            #     change_map_photo = encoder_results["context_change_map_photo_bv1hw"][0, i].cpu().numpy()
+            #     save_image(
+            #         torch.from_numpy(convert_scalar_map_to_pil(change_map_photo, no_text=True).transpose(2, 0, 1).astype(np.float32) / 255).to(batch["context"]["image"][0].device),
+            #         path / scene / f"change_map_photo/{index:0>6}.png",
+            #     )
+            # if self.test_cfg.save_context_change_maps and "context_change_map_geo_bv1hw" in encoder_results:
+            #     change_map_geo = encoder_results["context_change_map_geo_bv1hw"][0, i].cpu().numpy()
+            #     save_image(
+            #         torch.from_numpy(convert_scalar_map_to_pil(change_map_geo, no_text=True).transpose(2, 0, 1).astype(np.float32) / 255).to(batch["context"]["image"][0].device),
+            #         path / scene / f"change_map_geo/{index:0>6}.png",
+            #     )
             save_image(torch.from_numpy(convert_array_to_pil(encoder_results[f"depth_num0_s-1"][0][i].cpu().numpy().reshape(h,w), no_text=True).transpose(2,0,1)\
                                         .astype(np.float32)/255).to(batch["context"]["image"][0].device),
                                         path / scene / f"depth_pred/{index:0>6}.png")
@@ -512,6 +1127,7 @@ class ModelWrapper(LightningModule):
             self.benchmarker.store('ssim_inter', float(ssim))
             self.benchmarker.store('num_inter', float(num))
             self.benchmarker.store('num_gaussians', encoder_results['num_gaussians'])
+            self.benchmarker.store('rendered_num_gaussians', rendered_num_gaussians)
             self.test_fvs_list.append(False)
         else:
             length = batch["target"]["index"][0].shape[0]
@@ -529,6 +1145,7 @@ class ModelWrapper(LightningModule):
             self.benchmarker.store('ssim_extra', float(ssim_extra))
             self.benchmarker.store('num_extra', float(num_extra))
             self.benchmarker.store('num_gaussians', encoder_results['num_gaussians'])
+            self.benchmarker.store('rendered_num_gaussians', rendered_num_gaussians)
             self.test_fvs_list.append(True)
         if self.encoder_visualizer is not None:
             for k, image in self.encoder_visualizer.visualize(
@@ -568,38 +1185,72 @@ class ModelWrapper(LightningModule):
                                 self.benchmarker.benchmarks['depth_delta_10'][i])
             if np.isnan(self.benchmarker.benchmarks['depth_abs_diff'][i]) or np.isnan(self.benchmarker.benchmarks['depth_rel_diff'][i]) or np.isnan(self.benchmarker.benchmarks['depth_delta_25'][i]) or np.isnan(self.benchmarker.benchmarks['depth_delta_10'][i]):
                 nan_scenes.append(self.test_scene_list[i])
-        print('psnr_inter_avg:', (np.array(self.benchmarker.benchmarks['psnr_inter']) 
-                                * np.array(self.benchmarker.benchmarks['num_inter'])).sum()
-                                / np.array(self.benchmarker.benchmarks['num_inter']).sum(), 
-            'ssim_inter_avg:', (np.array(self.benchmarker.benchmarks['ssim_inter']) 
-                                * np.array(self.benchmarker.benchmarks['num_inter'])).sum()
-                                / np.array(self.benchmarker.benchmarks['num_inter']).sum(),
-            'lpips_inter_avg:', (np.array(self.benchmarker.benchmarks['lpips_inter']) 
-                                * np.array(self.benchmarker.benchmarks['num_inter'])).sum()
-                                / np.array(self.benchmarker.benchmarks['num_inter']).sum(),
-            'depth_abs_diff_avg:', torch.nanmean(torch.tensor(self.benchmarker.benchmarks['depth_abs_diff'])).cpu().numpy(),
-            'depth_rel_diff_avg:', torch.nanmean(torch.tensor(self.benchmarker.benchmarks['depth_rel_diff'])).cpu().numpy(),
-            'depth_delta_25_avg:', torch.nanmean(torch.tensor(self.benchmarker.benchmarks['depth_delta_25'])).cpu().numpy(),
-            'depth_delta_10_avg:', torch.nanmean(torch.tensor(self.benchmarker.benchmarks['depth_delta_10'])).cpu().numpy())
+        inter_num = np.array(self.benchmarker.benchmarks['num_inter'])
+        psnr_inter_avg = (np.array(self.benchmarker.benchmarks['psnr_inter']) * inter_num).sum() / inter_num.sum()
+        ssim_inter_avg = (np.array(self.benchmarker.benchmarks['ssim_inter']) * inter_num).sum() / inter_num.sum()
+        lpips_inter_avg = (np.array(self.benchmarker.benchmarks['lpips_inter']) * inter_num).sum() / inter_num.sum()
+        depth_abs_diff_avg = torch.nanmean(torch.tensor(self.benchmarker.benchmarks['depth_abs_diff'])).cpu().numpy()
+        depth_rel_diff_avg = torch.nanmean(torch.tensor(self.benchmarker.benchmarks['depth_rel_diff'])).cpu().numpy()
+        depth_delta_25_avg = torch.nanmean(torch.tensor(self.benchmarker.benchmarks['depth_delta_25'])).cpu().numpy()
+        depth_delta_10_avg = torch.nanmean(torch.tensor(self.benchmarker.benchmarks['depth_delta_10'])).cpu().numpy()
+        mean_encoder_time = np.mean(self.benchmarker.execution_times["encoder"]) if len(self.benchmarker.execution_times["encoder"]) > 0 else float("nan")
+        mean_decoder_time = np.mean(self.benchmarker.execution_times["decoder"]) if len(self.benchmarker.execution_times["decoder"]) > 0 else float("nan")
+        mean_encode_decode_total_time = (
+            mean_encoder_time + mean_decoder_time
+            if np.isfinite(mean_encoder_time) and np.isfinite(mean_decoder_time)
+            else float("nan")
+        )
+        fps = (1.0 / mean_decoder_time) if np.isfinite(mean_decoder_time) and mean_decoder_time > 0 else float("nan")
+        peak_memory_bytes = torch.cuda.memory_stats()["allocated_bytes.all.peak"] if torch.cuda.is_available() else 0.0
+        peak_memory_gb = peak_memory_bytes / (1024 ** 3)
+        summary_metrics = {}
+        def log_metric(key, value, digits=3):
+            value = float(value)
+            print(f"{key}: {value:.{digits}f}")
+            summary_metrics[key] = f"{value:.{digits}f}"
+
+        log_metric('psnr_inter_avg', psnr_inter_avg)
+        log_metric('ssim_inter_avg', ssim_inter_avg)
+        log_metric('lpips_inter_avg', lpips_inter_avg)
+        log_metric('depth_abs_diff_avg', depth_abs_diff_avg)
+        log_metric('depth_rel_diff_avg', depth_rel_diff_avg)
+        log_metric('depth_delta_25_avg', depth_delta_25_avg)
+        log_metric('depth_delta_10_avg', depth_delta_10_avg)
         try:
-            print('psnr_extra_avg:', (np.array(self.benchmarker.benchmarks['psnr_extra']) 
-                                * np.array(self.benchmarker.benchmarks['num_extra'])).sum()
-                                / np.array(self.benchmarker.benchmarks['num_extra']).sum(), 
-                'ssim_extra_avg:', (np.array(self.benchmarker.benchmarks['ssim_extra']) 
-                                    * np.array(self.benchmarker.benchmarks['num_extra'])).sum()
-                                    / np.array(self.benchmarker.benchmarks['num_extra']).sum(),
-                'lpips_extra_avg:', (np.array(self.benchmarker.benchmarks['lpips_extra']) 
-                                    * np.array(self.benchmarker.benchmarks['num_extra'])).sum()
-                                    / np.array(self.benchmarker.benchmarks['num_extra']).sum())
+            extra_num = np.array(self.benchmarker.benchmarks['num_extra'])
+            psnr_extra_avg = (np.array(self.benchmarker.benchmarks['psnr_extra']) * extra_num).sum() / extra_num.sum()
+            ssim_extra_avg = (np.array(self.benchmarker.benchmarks['ssim_extra']) * extra_num).sum() / extra_num.sum()
+            lpips_extra_avg = (np.array(self.benchmarker.benchmarks['lpips_extra']) * extra_num).sum() / extra_num.sum()
+            log_metric('psnr_extra_avg', psnr_extra_avg)
+            log_metric('ssim_extra_avg', ssim_extra_avg)
+            log_metric('lpips_extra_avg', lpips_extra_avg)
         except:
             pass
-        print('num_gaussians_avg:', self.benchmarker.benchmarks['num_gaussians_avg'])
+        rendered_num_gaussians_avg = self.benchmarker.benchmarks.get(
+            "rendered_num_gaussians_avg",
+            self.benchmarker.benchmarks["num_gaussians_avg"] * self.test_cfg.save_ratio,
+        )
+        log_metric('num_gaussians_avg', self.benchmarker.benchmarks["num_gaussians_avg"])
+        log_metric('rendered_num_gaussians_avg', rendered_num_gaussians_avg)
+        log_metric('peak_memory_gb', peak_memory_gb)
+        log_metric('mean_encoder_time', mean_encoder_time, digits=6)
+        log_metric('mean_decoder_time', mean_decoder_time, digits=6)
+        log_metric('mean_encode_decode_total_time', mean_encode_decode_total_time, digits=6)
+        log_metric('fps', fps)
+        summary_metrics_path = self.test_cfg.output_path / "terminal_metrics.json"
+        summary_metrics_path.parent.mkdir(parents=True, exist_ok=True)
+        with summary_metrics_path.open("w") as f:
+            json.dump(summary_metrics, f, indent=2)
         if len(nan_scenes) > 0:
             print('nan_depth_scenes:', nan_scenes)
 
     @rank_zero_only
-    def validation_step(self, batch, batch_idx):
+    def validation_step(self, batch, batch_idx):# 训练中的验证
         batch: BatchedExample = self.data_shim(batch)
+        if not (0.0 < self.test_cfg.save_ratio <= 1.0):
+            raise ValueError(
+                f"test.save_ratio must be in (0, 1], got {self.test_cfg.save_ratio}"
+            )
         context_indices = batch['context']['index'].tolist()
 
         (scene,) = batch["scene"]
@@ -618,7 +1269,20 @@ class ModelWrapper(LightningModule):
             deterministic=False,
             is_testing=True,
         )
-        gaussians_probabilistic = encoder_probabilistic_results['gaussians']
+        gaussians_probabilistic_full = encoder_probabilistic_results['gaussians']
+
+        # 验证阶段默认固定 mode=3，并与 test_step 的 mode=3 路径保持一致。
+        importance_scores = encoder_probabilistic_results.get("gaussians_importance_scores", None)
+        keep_ratio = self.test_cfg.save_ratio
+        if keep_ratio >= 1.0 and "prune_keep_ratio" in encoder_probabilistic_results:
+            keep_ratio = float(encoder_probabilistic_results["prune_keep_ratio"])
+        tau_end = get_pruning_tau_end(self.encoder)
+        gaussians_probabilistic = prune_gaussians_mode3_with_gated_opacity(
+            gaussians_probabilistic_full,
+            keep_ratio,
+            importance_scores=importance_scores,
+            tau=tau_end,
+        )
         if not isinstance(gaussians_probabilistic, list):
             output_probabilistic = self.decoder.forward(
                 gaussians_probabilistic,
@@ -913,14 +1577,71 @@ class ModelWrapper(LightningModule):
                 clip.write_videofile(
                     str(dir / f"{self.global_step:0>6}.mp4"), logger=None
                 )
-
+    # 仅收集 requires_grad=True 参数，并打印可训练参数量
     def configure_optimizers(self):
-        optimizer = optim.Adam(self.parameters(), lr=self.optimizer_cfg.lr)
+        param_groups = []
+        if self.train_cfg.train_only_importance_head:
+            module_defs: list[tuple[str, nn.Module | None, float | None]] = [
+                ("importance_head", getattr(self.encoder, "importance_head", None), self.optimizer_cfg.lr_importance_head),
+                ("gru", getattr(self.encoder, "gru", None), self.optimizer_cfg.lr_gru),
+                ("to_gaussians", getattr(self.encoder, "to_gaussians", None), self.optimizer_cfg.lr_to_gaussians),
+                ("depth_decoder", getattr(self.encoder, "depth_decoder", None), self.optimizer_cfg.lr_depth_decoder),
+            ]
+            high_resolution_skip = getattr(self.encoder, "high_resolution_skip", None)
+            module_defs.append(
+                (
+                    "high_resolution_skip.0",
+                    high_resolution_skip[0] if high_resolution_skip is not None and len(high_resolution_skip) > 0 else None,
+                    self.optimizer_cfg.lr_high_resolution_skip0,
+                )
+            )
+
+            seen_param_ids: set[int] = set()
+            for module_name, module, module_lr in module_defs:
+                if module is None:
+                    continue
+                params = [p for p in module.parameters() if p.requires_grad and id(p) not in seen_param_ids]
+                if len(params) == 0:
+                    continue
+                for p in params:
+                    seen_param_ids.add(id(p))
+                lr_value = float(self.optimizer_cfg.lr if module_lr is None else module_lr)
+                param_groups.append(
+                    {
+                        "name": module_name,
+                        "params": params,
+                        "lr": lr_value,
+                    }
+                )
+        else:
+            trainable_params = [p for p in self.parameters() if p.requires_grad]
+            if len(trainable_params) > 0:
+                param_groups.append(
+                    {
+                        "name": "default",
+                        "params": trainable_params,
+                        "lr": float(self.optimizer_cfg.lr),
+                    }
+                )
+
+        if len(param_groups) == 0:
+            raise ValueError("No trainable parameters found for optimizer.")
+        self.trainable_param_count = sum(p.numel() for group in param_groups for p in group["params"])
+        print(f"Trainable parameters: {self.trainable_param_count}")
+        for group in param_groups:
+            print(
+                f"[Optimizer] group={group['name']} "
+                f"num_tensors={len(group['params'])} "
+                f"lr={group['lr']:.6e}"
+            )
+        optimizer = optim.Adam(param_groups, lr=self.optimizer_cfg.lr)
         warm_up_steps = self.optimizer_cfg.warm_up_steps
         if self.optimizer_cfg.cosine_lr:
+            max_lrs = [group["lr"] for group in param_groups]
             warm_up = torch.optim.lr_scheduler.OneCycleLR(
-                            optimizer, self.optimizer_cfg.lr,
-                            self.trainer.max_steps + 1,
+                            optimizer,
+                            max_lr=max_lrs,
+                            total_steps=self.trainer.max_steps + 1,
                             pct_start=0.001,
                             cycle_momentum=False,
                             anneal_strategy='cos',

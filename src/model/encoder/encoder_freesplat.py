@@ -54,11 +54,11 @@ class BudgetPruningCfg:
     enabled: bool = True
     keep_ratio: float = 0.8
     lambda_budget: float = 0.2
-    lambda_bin: float = 0.005
+    lambda_mod: float = 0.01
     lambda_bce: float = 0.05
-    tau_start: float = 0.5
+    tau_start: float = 0.05
     tau_end: float = 0.3
-    total_steps: int = 300000
+    total_steps: int = 120000
 
 
 UseDepthMode = Literal[
@@ -735,6 +735,8 @@ class EncoderFreeSplat(Encoder[EncoderFreeSplatCfg]):
         fused_features = []#每个样本的全局融合特征（与最终高斯一一对应）
         fused_weights = []#每个样本的全局融合权重（与最终高斯一一对应）
         fused_changes = []#每个样本的全局融合变化值（与最终高斯一一对应）
+        cur_gaussians_now_ch0 = []#每个样本的 cur_gaussians_now 第0通道（映射后、sigmoid前）
+        importance_scores_processed = []#每个样本处理后的重要性分数（标准化+tanh）
         num_raw_gaussians = gaussians[0].shape[2] * gaussians[0].shape[1]#融合前原始高斯数量V*H*W
         B = gaussians[0].shape[0]#B
         for b in range(B):
@@ -774,12 +776,31 @@ class EncoderFreeSplat(Encoder[EncoderFreeSplatCfg]):
             # 记录融合后的全局特征（在映射到高斯参数之前）
             cur_fused_features = cur_gaussians
 
-            # 将融合特征映射成高斯参数
+            # 将融合特征映射成高斯参数，36通道，0通道是原始的opacity logit
             cur_gaussians_now = rearrange(
                             self.to_gaussians(cur_gaussians),
                             "... (srf c) -> ... srf c",
                             srf=self.cfg.num_surfaces,
                         )
+            cur_gaussians_now_ch0.append(
+                rearrange(cur_gaussians_now[..., 0], "b r srf -> b (r srf)")
+            )
+            # 重要性分数：raw -> 标准化 -> tanh，范围约束到 [-1, 1]。
+            head_weight = rearrange(cur_fused_densities, "b r () () -> b r 1")
+            # 原始的opacity logit, cur_gaussians_now 的第0通道值
+            head_opacity = cur_gaussians_now[..., 0][:, :, :1]
+            head_input = torch.cat(
+                [cur_fused_features, torch.log1p(head_weight), head_opacity],
+                dim=-1,
+            )
+            score_raw = self.importance_head(head_input).squeeze(-1)
+            score_mean = score_raw.mean(dim=-1, keepdim=True)
+            score_std = score_raw.std(dim=-1, keepdim=True, unbiased=False)
+            score_norm = (score_raw - score_mean) / (score_std + 1e-6)
+            score_tanh = torch.tanh(score_norm)
+            importance_scores_processed.append(score_tanh)
+            opacity_logits = cur_gaussians_now[..., 0] + score_tanh.unsqueeze(-1)
+            opacity_with_importance = torch.sigmoid(opacity_logits).unsqueeze(-1)
 
             # 通过高斯参数生成标准 Gaussians 对象            
             cur_gaussians = self.gaussian_adapter.forward(
@@ -791,8 +812,8 @@ class EncoderFreeSplat(Encoder[EncoderFreeSplatCfg]):
                 rearrange(xy_ray[b:b+1], "b v r srf xy -> b v r srf () xy"),
                 # 融合后深度作为射线采样距离
                 rearrange(cur_depths, "b r -> b () r () ()"),
-                # 0 通道经过 sigmoid - 不透明度参数 ？？？
-                nn.Sigmoid()(rearrange(cur_gaussians_now[..., :1], "b r srf c -> b () r srf c")),
+                # 不透明度参数：sigmoid(高斯第0通道 + 处理后的重要性分数)。
+                rearrange(opacity_with_importance, "b r srf c -> b () r srf c"),
                 # 从 2 通道开始 - 几何与外观参数
                 rearrange(cur_gaussians_now[..., 2:], "b r srf c -> b () r srf () c"),
                 (h, w),
@@ -870,6 +891,8 @@ class EncoderFreeSplat(Encoder[EncoderFreeSplatCfg]):
         results['gaussians_fused_features'] = fused_features
         results['gaussians_fused_weights'] = fused_weights_flat
         results['gaussians_fused_changes'] = fused_changes_flat
+        results['cur_gaussians_now_ch0'] = cur_gaussians_now_ch0
+        results['gaussians_importance_scores'] = importance_scores_processed
         # - 对于每个样本 i，高斯索引 g 一一对应：
         # - results['gaussians'][i].means[:, g, ...] / covariances / harmonics / opacities
         # - results['gaussians_fused_features'][i][:, g, ...]
@@ -887,48 +910,31 @@ class EncoderFreeSplat(Encoder[EncoderFreeSplatCfg]):
         if self.cfg.budget_pruning.enabled:
             cfg_prune = self.cfg.budget_pruning
             tau = None if is_testing else self._pruning_temperature(global_step)
-            scores_per_sample = []
+            scores_per_sample = importance_scores_processed
             gates_per_sample = []
-            pruned_gaussians = []
             budget_terms = []
-            bin_terms = []
+            mod_terms = []
             bce_terms = []
-            # gs原始标准高斯对象, feat高斯融合特征, weight高斯融合权重
-            for gs, feat, weight, change in zip(final_gs, fused_features, fused_weights_flat, fused_changes_flat):
-                z = torch.cat(
-                    [feat, torch.log1p(weight).unsqueeze(-1), gs.opacities.unsqueeze(-1)],
-                    dim=-1,
-                )
-                scores = self.importance_head(z).squeeze(-1)
-                scores_per_sample.append(scores)#重要性分数
+            # 使用处理后的重要性分数，仅用于预算相关损失与统计。
+            for gs, score, change in zip(final_gs, scores_per_sample, fused_changes_flat):
                 if not is_testing:#训练软门控
-                    gates = torch.sigmoid(scores / tau)
+                    gates = torch.sigmoid(score / tau)
                     gates_per_sample.append(gates)
-                    pruned_gaussians.append(
-                        Gaussians(#剪枝后的高斯对象，opacities乘以 gates 软门控
-                            gs.means,
-                            gs.covariances,
-                            gs.harmonics,
-                            gs.opacities * gates,
-                        )
-                    )
                     # teacher 采用排序名次映射：rank / (N-1), rank ∈ [0, N-1]
                     ranks = torch.argsort(torch.argsort(change, dim=-1), dim=-1).to(change.dtype)
                     denom = float(max(change.shape[-1] - 1, 1))
                     teacher = ranks / denom
                     budget_terms.append((gates.mean() - cfg_prune.keep_ratio) ** 2)#预算损失，鼓励平均保留率接近目标 keep_ratio
-                    bin_terms.append((gates * (1 - gates)).mean())#二值化正则项，鼓励 gate 接近 0 或 1
-                    bce_terms.append(F.binary_cross_entropy(gates.clamp(1e-6, 1 - 1e-6), teacher))
-                else:#测试直接硬剪枝,不改变高斯属性
-                    pruned_gaussians.append(gs)
-
-            results['gaussians'] = pruned_gaussians#原有高斯对象被覆盖
-            results['gaussians_importance_scores'] = scores_per_sample
+                    mod_terms.append((score ** 2).mean())#调制正则项：tanh后分数的平方均值
+                    # BCE 约束对象改为新的不透明度（而非 gate）。
+                    bce_terms.append(
+                        F.binary_cross_entropy(gs.opacities.clamp(1e-6, 1 - 1e-6), teacher)
+                    )
             results['prune_keep_ratio'] = cfg_prune.keep_ratio
             if not is_testing:
                 results['gaussians_soft_gates'] = gates_per_sample
                 results['prune_budget_loss'] = cfg_prune.lambda_budget * torch.stack(budget_terms).mean()
-                results['prune_bin_loss'] = cfg_prune.lambda_bin * torch.stack(bin_terms).mean()
+                results['prune_mod_loss'] = cfg_prune.lambda_mod * torch.stack(mod_terms).mean()
                 results['prune_bce_loss'] = cfg_prune.lambda_bce * torch.stack(bce_terms).mean()
                 # 软门控的平均激活率，可理解为当前实际保留比例（soft）
                 results['prune_gate_ratio'] = torch.stack([x.mean() for x in gates_per_sample]).mean()

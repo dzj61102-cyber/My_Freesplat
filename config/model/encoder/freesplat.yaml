@@ -11,12 +11,12 @@ opacity_mapping:
 budget_pruning:
   enabled: true
   keep_ratio: 0.8
-  lambda_budget: 0.2
-  lambda_bin: 0.005
+  lambda_budget: 0.05
+  lambda_mod: 0.01
   lambda_bce: 0.05
   tau_start: 0.5
   tau_end: 0.3
-  total_steps: 150000
+  total_steps: 120000
 
 num_surfaces: 1
 
