@@ -301,6 +301,7 @@ class EncoderFreeSplat(Encoder[EncoderFreeSplatCfg]):
         # 将概率密度映射为不透明度，兼顾低密度与高密度区域梯度
         return 0.5 * (1 - (1 - pdf) ** exponent + pdf ** (1 / exponent))
 
+    # 常规版本
     def _compute_voxel_size_from_gaussians(
         self,
         gs: Gaussians,
@@ -318,24 +319,136 @@ class EncoderFreeSplat(Encoder[EncoderFreeSplatCfg]):
             -1, covariances.shape[-3], covariances.shape[-2], covariances.shape[-1]
         )[0]
 
-        # Step 1: v = 2.5 * median((x1*x2*x3)^(1/6))
+        # Step 1: v = 2 * median((x1*x2*x3)^(1/6))
         eigvals = torch.linalg.eigvalsh(covariances).clamp_min(0.0)
         scale_proxy = eigvals.prod(dim=-1).clamp_min(1e-24).pow(1.0 / 6.0)
         m = torch.median(scale_proxy)
-        v_raw = 2 * m
+        v_raw = 2.3 * m
+        return v_raw
 
-        # Step 2: L = ||mu_max - mu_min||_2, 并限制 v 上下限
-        mu_max = means.max(dim=0).values
-        mu_min = means.min(dim=0).values
-        bbox_diag = torch.linalg.norm(mu_max - mu_min, ord=2)
-        v_min = 0.0001 * bbox_diag
-        v_max = 0.0002 * bbox_diag
-        v_limited = torch.clamp(v_raw, min=v_min, max=v_max)
+        # # Step 2: L = ||mu_max - mu_min||_2, 并限制 v 上下限
+        # mu_max = means.max(dim=0).values
+        # mu_min = means.min(dim=0).values
+        # bbox_diag = torch.linalg.norm(mu_max - mu_min, ord=2)
+        # v_min = 0.0001 * bbox_diag
+        # v_max = 0.0002 * bbox_diag
+        # v_limited = torch.clamp(v_raw, min=v_min, max=v_max)
 
-        # 退化盒子（L≈0）时，保留非零 v_raw，避免后续体素划分除零。
-        eps = torch.tensor(1e-8, device=v_limited.device, dtype=v_limited.dtype)
-        v_limited = torch.where(bbox_diag <= eps, torch.clamp_min(v_raw, eps), v_limited)
-        return v_limited, v_raw, bbox_diag
+        # # 退化盒子（L≈0）时，保留非零 v_raw，避免后续体素划分除零。
+        # eps = torch.tensor(1e-8, device=v_limited.device, dtype=v_limited.dtype)
+        # v_limited = torch.where(bbox_diag <= eps, torch.clamp_min(v_raw, eps), v_limited)
+        # return v_limited, v_raw, bbox_diag
+    
+    # #30veiw版本
+    # def _compute_voxel_size_from_gaussians(
+    #     self,
+    #     gs: Gaussians,
+    # ) -> tuple[Tensor, Tensor, Tensor]:
+    #     """按规则计算体素边长（初始值 + 包围盒约束），并加入数值稳定性保护。
+
+    #     Returns:
+    #         (v_limited, v_raw, bbox_diag) 均为标量 Tensor。
+    #     """
+    #     means = gs.means
+    #     covariances = gs.covariances
+
+    #     # 兼容输入 [B, G, ...]，测试阶段 B=1。
+    #     means = means.reshape(-1, means.shape[-2], means.shape[-1])[0]              # [G, 3]
+    #     covariances = covariances.reshape(
+    #         -1, covariances.shape[-3], covariances.shape[-2], covariances.shape[-1]
+    #     )[0]                                                                        # [G, 3, 3]
+
+    #     device = means.device
+    #     dtype = means.dtype
+    #     eps = torch.tensor(1e-8, device=device, dtype=dtype)
+
+    #     # ---------------------------
+    #     # Step 0: 基本数值合法性检查
+    #     # ---------------------------
+    #     # Step 0: 基本数值合法性检查
+    #     means_finite_mask = torch.isfinite(means).all(dim=-1)            # [G]
+    #     cov_finite_mask = torch.isfinite(covariances).all(dim=-1).all(dim=-1)  # [G]
+    #     valid_mask = means_finite_mask & cov_finite_mask
+
+    #     # 若存在非法高斯，先过滤掉
+    #     means_valid = means[valid_mask]
+    #     covariances_valid = covariances[valid_mask]
+
+    #     # 如果全部非法，直接给安全回退
+    #     if means_valid.shape[0] == 0:
+    #         # 给一个极小但非零的安全值，避免后续体素划分除零
+    #         fallback = torch.tensor(1e-4, device=device, dtype=dtype)
+    #         return fallback, fallback, torch.tensor(0.0, device=device, dtype=dtype)
+
+    #     # ---------------------------
+    #     # Step 1: 计算 bbox_diag
+    #     # bbox 用 valid means 计算，避免 NaN 传播
+    #     # ---------------------------
+    #     mu_max = means_valid.max(dim=0).values
+    #     mu_min = means_valid.min(dim=0).values
+    #     bbox_diag = torch.linalg.norm(mu_max - mu_min, ord=2)
+
+    #     # ---------------------------
+    #     # Step 2: 计算协方差特征值
+    #     # 先做对称化，减小数值误差
+    #     # ---------------------------
+    #     covariances_valid = 0.5 * (covariances_valid + covariances_valid.transpose(-1, -2))
+
+    #     # eigvalsh 前再次 try/except 兜底
+    #     try:
+    #         eigvals = torch.linalg.eigvalsh(covariances_valid)
+    #     except RuntimeError as e:
+    #         print("[VoxelSize] eigvalsh failed, fallback used.")
+    #         print(f"[VoxelSize] valid cov count: {covariances_valid.shape[0]}")
+    #         print(f"[VoxelSize] bbox_diag: {bbox_diag.item():.8f}")
+    #         fallback = torch.clamp_min(0.0001 * bbox_diag, eps)
+    #         return fallback, fallback, bbox_diag
+
+    #     # 过滤特征值中的 NaN/Inf
+    #     eigvals_finite_mask = torch.isfinite(eigvals).all(dim=-1)                   # [G_valid]
+    #     eigvals = eigvals[eigvals_finite_mask]
+
+    #     if eigvals.shape[0] == 0:
+    #         print("[VoxelSize] No valid eigenvalues, fallback used.")
+    #         fallback = torch.clamp_min(0.0001 * bbox_diag, eps)
+    #         return fallback, fallback, bbox_diag
+
+    #     # 限制为非负，避免轻微数值负值
+    #     eigvals = eigvals.clamp_min(0.0)
+
+    #     # Step 1 in your design:
+    #     # scale_proxy = (x1 * x2 * x3)^(1/6)
+    #     scale_proxy = eigvals.prod(dim=-1).clamp_min(1e-24).pow(1.0 / 6.0)
+
+    #     # 再次过滤非有限 scale_proxy
+    #     scale_proxy = scale_proxy[torch.isfinite(scale_proxy)]
+    #     if scale_proxy.numel() == 0:
+    #         print("[VoxelSize] No valid scale_proxy, fallback used.")
+    #         fallback = torch.clamp_min(0.0001 * bbox_diag, eps)
+    #         return fallback, fallback, bbox_diag
+
+    #     m = torch.median(scale_proxy)
+
+    #     v_raw = 2.0 * m
+
+    #     # Step 2: 包围盒约束
+    #     v_min = 0.0001 * bbox_diag
+    #     v_max = 0.0002 * bbox_diag
+    #     v_limited = torch.clamp(v_raw, min=v_min, max=v_max)
+
+    #     # 退化盒子（L≈0）时，保留非零 v_raw，避免后续体素划分除零
+    #     v_limited = torch.where(bbox_diag <= eps, torch.clamp_min(v_raw, eps), v_limited)
+
+    #     # 最后再保证输出有限且非零
+    #     if not torch.isfinite(v_limited):
+    #         print("[VoxelSize] v_limited invalid, fallback used.")
+    #         v_limited = torch.clamp_min(0.0001 * bbox_diag, eps)
+
+    #     if not torch.isfinite(v_raw):
+    #         print("[VoxelSize] v_raw invalid, set to v_limited.")
+    #         v_raw = v_limited
+
+    #     return v_limited, v_raw, bbox_diag
 
     def _voxel_aggregate_gaussians(
         self,
@@ -343,8 +456,10 @@ class EncoderFreeSplat(Encoder[EncoderFreeSplatCfg]):
         scores: Tensor,
         voxel_size: Tensor,
         tau: float = 0.5,
-    ) -> tuple[Gaussians, Tensor, Tensor, Tensor]:
+        collect_pending_stats: bool = False,
+    ) -> tuple[Gaussians, Tensor, Tensor, Tensor, Tensor]:
         """按体素聚合单样本高斯（步骤 3-5）。"""
+        # Step 0: 基本数值合法性检查
         means = gs.means.reshape(-1, gs.means.shape[-2], gs.means.shape[-1])[0]
         covariances = gs.covariances.reshape(
             -1, gs.covariances.shape[-3], gs.covariances.shape[-2], gs.covariances.shape[-1]
@@ -362,31 +477,87 @@ class EncoderFreeSplat(Encoder[EncoderFreeSplatCfg]):
         _, inverse = torch.unique(voxel_indices, dim=0, return_inverse=True)
         n_voxels = int(inverse.max().item()) + 1 if inverse.numel() > 0 else 0
         if n_voxels == 0:
-            return gs, scores.unsqueeze(0), scores.unsqueeze(0), torch.tensor(0, device=means.device)
+            empty_stats = torch.zeros(3, device=means.device, dtype=means.dtype)
+            return (
+                gs,
+                scores.unsqueeze(0),
+                torch.tensor(0, device=means.device),
+                empty_stats,
+                torch.zeros(0, device=means.device, dtype=torch.long),
+            )
 
         counts = torch.bincount(inverse, minlength=n_voxels).to(means.dtype)
+        counts_long = counts.to(torch.long)
+        if collect_pending_stats:
+            per_voxel_pending_gaussians_stats = torch.stack(
+                [counts.mean(), counts.max(), counts.min()]
+            )
+        else:
+            per_voxel_pending_gaussians_stats = torch.zeros(
+                3, device=means.device, dtype=means.dtype
+            )
 
-        # Step 4: 体素内 z-score 标准化得到u；体素内聚合权重 w = softmax(u / tau)。
-        score_sum = torch.zeros(n_voxels, device=means.device, dtype=means.dtype)
-        score_sum.index_add_(0, inverse, scores)
-        score_sq_sum = torch.zeros(n_voxels, device=means.device, dtype=means.dtype)
-        score_sq_sum.index_add_(0, inverse, scores * scores)
-        score_mean = score_sum / torch.clamp_min(counts, 1.0)
-        score_var = (score_sq_sum / torch.clamp_min(counts, 1.0) - score_mean * score_mean).clamp_min(0.0)
-        score_std = torch.sqrt(score_var + 1e-6)
-        zscores = (scores - score_mean[inverse]) / score_std[inverse]#每个原始高斯在其所属体素内的 z-score 标准化分数
-
-        logits = zscores / tau_tensor
+        # Step 4: 依据用户给定公式计算正值重要性/主导占比/主导索引/聚合权重/自适应融合系数。
+        # r_i = softplus(score_i)
+        pos_scores = torch.nn.functional.softplus(scores)
+        r_sum = torch.zeros(n_voxels, device=means.device, dtype=means.dtype)
+        r_sum.index_add_(0, inverse, pos_scores)
+        # p_i = r_i / sum_j r_j
+        p = pos_scores / torch.clamp_min(r_sum[inverse], eps)
+        # i* = argmax_i p_i,  rho_m = p_{i*}
+        dominant_ratio = torch.full((n_voxels,), -torch.inf, device=means.device, dtype=means.dtype)
+        dominant_ratio.scatter_reduce_(0, inverse, p, reduce="amax", include_self=True)
+        n_gaussians = p.shape[0]
+        gaussian_indices = torch.arange(n_gaussians, device=means.device, dtype=torch.long)
+        dominant_index_candidates = torch.where(
+            p >= (dominant_ratio[inverse] - 1e-12),
+            gaussian_indices,
+            torch.full_like(gaussian_indices, n_gaussians),
+        )
+        dominant_indices = torch.full(
+            (n_voxels,), n_gaussians, device=means.device, dtype=torch.long
+        )
+        dominant_indices.scatter_reduce_(
+            0, inverse, dominant_index_candidates, reduce="amin", include_self=True
+        )
+        dominant_indices = dominant_indices.clamp_max(n_gaussians - 1)
+        # lambda_m = gamma * (1 - rho_m), gamma = 0.5
+        gamma = torch.tensor(0.5, device=means.device, dtype=means.dtype)
+        lambda_m = gamma * (1.0 - dominant_ratio)
+        # w_i = softmax(r_i / tau) (体素内)
+        logits = pos_scores / tau_tensor
         group_max = torch.full((n_voxels,), -torch.inf, device=means.device, dtype=means.dtype)
         group_max.scatter_reduce_(0, inverse, logits, reduce="amax", include_self=True)
         exp_logits = torch.exp(logits - group_max[inverse])
         group_exp_sum = torch.zeros(n_voxels, device=means.device, dtype=means.dtype)
         group_exp_sum.index_add_(0, inverse, exp_logits)
         weights = exp_logits / torch.clamp_min(group_exp_sum[inverse], eps)
+        # ===== 旧实现（按 z-score softmax 直接加权）保留注释，不删除 =====
+        # score_sum = torch.zeros(n_voxels, device=means.device, dtype=means.dtype)
+        # score_sum.index_add_(0, inverse, scores)
+        # score_sq_sum = torch.zeros(n_voxels, device=means.device, dtype=means.dtype)
+        # score_sq_sum.index_add_(0, inverse, scores * scores)
+        # score_mean = score_sum / torch.clamp_min(counts, 1.0)
+        # score_var = (score_sq_sum / torch.clamp_min(counts, 1.0) - score_mean * score_mean).clamp_min(0.0)
+        # score_std = torch.sqrt(score_var + 1e-6)
+        # zscores = (scores - score_mean[inverse]) / score_std[inverse]
+        # logits = zscores / tau_tensor
+        # group_max = torch.full((n_voxels,), -torch.inf, device=means.device, dtype=means.dtype)
+        # group_max.scatter_reduce_(0, inverse, logits, reduce="amax", include_self=True)
+        # exp_logits = torch.exp(logits - group_max[inverse])
+        # group_exp_sum = torch.zeros(n_voxels, device=means.device, dtype=means.dtype)
+        # group_exp_sum.index_add_(0, inverse, exp_logits)
+        # weights = exp_logits / torch.clamp_min(group_exp_sum[inverse], eps)
+        # agg_means = torch.zeros((n_voxels, 3), device=means.device, dtype=means.dtype)
+        # agg_means.index_add_(0, inverse, weights[:, None] * means)
 
-        # Step 5: 体素内聚合（中心/SH 加权，分数求和，不透明度按 w 组合,协方差二阶矩合成）。
-        agg_means = torch.zeros((n_voxels, 3), device=means.device, dtype=means.dtype)
-        agg_means.index_add_(0, inverse, weights[:, None] * means)
+        # Step 5: 体素内聚合（中心/SH 按“主导项 + 自适应残差”融合；协方差/opacity 延续原稳定实现）。
+        # mu'_m = mu_{i*} + lambda_m * sum_i w_i (mu_i - mu_{i*})
+        dominant_means = means.index_select(0, dominant_indices)
+        mean_offsets_to_dominant = means - dominant_means[inverse]
+        weighted_mean_offsets = torch.zeros((n_voxels, 3), device=means.device, dtype=means.dtype)
+        weighted_mean_offsets.index_add_(0, inverse, weights[:, None] * mean_offsets_to_dominant)
+        agg_means = dominant_means + lambda_m[:, None] * weighted_mean_offsets
 
         # 协方差按二阶矩合成：
         # Sigma'_m = sum_i w_i * (Sigma_i + (mu_i - mu'_m)(mu_i - mu'_m)^T)
@@ -399,28 +570,43 @@ class EncoderFreeSplat(Encoder[EncoderFreeSplatCfg]):
         agg_covariances = agg_cov_flat.reshape(n_voxels, 3, 3)
         agg_covariances = 0.5 * (agg_covariances + agg_covariances.transpose(-1, -2))
 
-        sh_flat = harmonics.reshape(harmonics.shape[0], -1)
-        agg_sh_flat = torch.zeros((n_voxels, sh_flat.shape[-1]), device=means.device, dtype=means.dtype)
-        agg_sh_flat.index_add_(0, inverse, weights[:, None] * sh_flat)
-        agg_harmonics = agg_sh_flat.reshape(n_voxels, harmonics.shape[1], harmonics.shape[2])
+        # c'_m = c_{i*} + lambda_m * sum_i w_i (c_i - c_{i*})
+        harmonics_flat = harmonics.reshape(harmonics.shape[0], -1)
+        dominant_harmonics_flat = harmonics_flat.index_select(0, dominant_indices)
+        harmonics_offsets_to_dominant = harmonics_flat - dominant_harmonics_flat[inverse]
+        weighted_harmonics_offsets = torch.zeros(
+            (n_voxels, harmonics_flat.shape[-1]), device=means.device, dtype=means.dtype
+        )
+        weighted_harmonics_offsets.index_add_(
+            0, inverse, weights[:, None] * harmonics_offsets_to_dominant
+        )
+        agg_harmonics_flat = dominant_harmonics_flat + lambda_m[:, None] * weighted_harmonics_offsets
+        agg_harmonics = agg_harmonics_flat.reshape(n_voxels, harmonics.shape[1], harmonics.shape[2])
 
-        alpha = opacities.clamp(0.0, 1.0 - 1e-6)
+        alpha = opacities.reshape(-1).clamp(0.0, 1.0 - 1e-6)
         log_terms = weights * torch.log1p(-alpha)
         log_prod = torch.zeros(n_voxels, device=means.device, dtype=means.dtype)
         log_prod.index_add_(0, inverse, log_terms)
-        agg_opacities = (1.0 - torch.exp(log_prod)).clamp(0.0, 1.0)
+        agg_opacities = (1.0 - torch.exp(log_prod)).clamp(0.0, 1.0 - 1e-6)
 
         # 每个体素聚合后的重要性分数：softplus(scores) 按聚合权重 w 加权叠加。
         score_sp = torch.nn.functional.softplus(scores)
-        agg_scores = torch.zeros(n_voxels, device=means.device, dtype=means.dtype)
-        agg_scores.index_add_(0, inverse, weights * score_sp)
+        agg_pos_scores = torch.zeros(n_voxels, device=means.device, dtype=means.dtype)
+        agg_pos_scores.index_add_(0, inverse, weights * score_sp)
+
         aggregated = Gaussians(
             agg_means.unsqueeze(0),
             agg_covariances.unsqueeze(0),
             agg_harmonics.unsqueeze(0),
             agg_opacities.unsqueeze(0),
         )
-        return aggregated, agg_scores.unsqueeze(0), zscores.unsqueeze(0), torch.tensor(n_voxels, device=means.device)
+        return (
+            aggregated,
+            agg_pos_scores.unsqueeze(0),
+            torch.tensor(n_voxels, device=means.device),
+            per_voxel_pending_gaussians_stats,
+            counts_long,
+        )
     
     def forward(
         self,
@@ -797,9 +983,10 @@ class EncoderFreeSplat(Encoder[EncoderFreeSplatCfg]):
             
         # 统计融合效果
         # 融合前后高斯数量和压缩率
-        num_gaussians = our_gaussians[0].means.shape[2]
+        num_gaussians = int(sum(int(gs.means.shape[2]) for gs in our_gaussians))
         results['gs_ratio'] = num_gaussians / num_raw_gaussians
         gaussians = cur_gaussians #把 gaussians 赋成了最后一个样本的 cur_gaussians
+        # 统一口径：始终表示 PTF 融合后、任何后处理（体素聚合/剪枝）前的高斯数量。
         results['fused_num_gaussians'] = num_gaussians
 
 
@@ -861,18 +1048,20 @@ class EncoderFreeSplat(Encoder[EncoderFreeSplatCfg]):
         # results['gaussians_fused_weights'][0] shape: torch.Size([1, 330239])
 
         # 在 train/val/test 统一执行与测试阶段一致的体素聚合流程。
-        test_voxel_size = []
-        test_voxel_size_raw = []
-        test_bbox_diag = []
+        # test_voxel_size = []
+        # test_voxel_size_raw = []
+        # test_bbox_diag = []
         test_num_gaussians_aggregated = []
+        test_voxel_pending_gaussians_stats = []
+        test_voxel_gaussian_counts_per_voxel = []
         aggregated_gs = []
         aggregated_scores = []
-        aggregated_zscores = []
         for idx, gs in enumerate(final_gs):
-            v_limited, v_raw, bbox_diag = self._compute_voxel_size_from_gaussians(gs)
-            test_voxel_size.append(v_limited)
-            test_voxel_size_raw.append(v_raw)
-            test_bbox_diag.append(bbox_diag)
+            v_limited = self._compute_voxel_size_from_gaussians(gs)
+            # v_limited, v_raw, bbox_diag = self._compute_voxel_size_from_gaussians(gs)
+            # test_voxel_size.append(v_limited)
+            # test_voxel_size_raw.append(v_raw)
+            # test_bbox_diag.append(bbox_diag)
 
             if self.cfg.budget_pruning.enabled:
                 feat = fused_features[idx]
@@ -886,26 +1075,28 @@ class EncoderFreeSplat(Encoder[EncoderFreeSplatCfg]):
                 # 若未启用 learned score，则回退到 opacity 作为重要性分数。
                 scores = gs.opacities
 
-            gs_agg, s_agg, z_agg, n_agg = self._voxel_aggregate_gaussians(
-                gs, scores, v_limited, tau=0.5
+            gs_agg, s_agg, n_agg, c_stats, counts_per_voxel = self._voxel_aggregate_gaussians(
+                gs, scores, v_limited, tau=0.5, collect_pending_stats=is_testing
             )
             aggregated_gs.append(gs_agg)
             aggregated_scores.append(s_agg)
-            aggregated_zscores.append(z_agg)
             test_num_gaussians_aggregated.append(n_agg)
+            if is_testing:
+                test_voxel_pending_gaussians_stats.append(c_stats)
+                test_voxel_gaussian_counts_per_voxel.append(counts_per_voxel)
 
-        results["fused_num_gaussians_before_voxel_aggregation"] = results["fused_num_gaussians"]
         final_gs = aggregated_gs
         results["gaussians"] = final_gs
         results["gaussians_importance_scores"] = aggregated_scores
-        results["gaussians_voxel_zscores"] = aggregated_zscores
-        results["fused_num_gaussians"] = int(sum(int(gs.means.shape[1]) for gs in final_gs))
-        results["test_voxel_size"] = test_voxel_size
-        results["test_voxel_size_raw"] = test_voxel_size_raw
-        results["test_bbox_diag"] = test_bbox_diag
+        # 注意：不再在体素聚合后覆盖 results["fused_num_gaussians"]，
+        # 保持其“PTF 融合后、后处理前”的固定语义。
+        # results["test_voxel_size"] = test_voxel_size
+        # results["test_voxel_size_raw"] = test_voxel_size_raw
+        # results["test_bbox_diag"] = test_bbox_diag
         results["test_num_gaussians_aggregated"] = test_num_gaussians_aggregated
-        if self.cfg.budget_pruning.enabled:
-            results["prune_keep_ratio"] = self.cfg.budget_pruning.keep_ratio
+        if is_testing:
+            results["test_voxel_pending_gaussians_stats"] = test_voxel_pending_gaussians_stats
+            results["test_voxel_gaussian_counts_per_voxel"] = test_voxel_gaussian_counts_per_voxel
         # 打印
         # print(f"[EncoderFreeSplat] results['gs_ratio']: {results['gs_ratio']}")
         # print(f"[EncoderFreeSplat] results['fused_num_gaussians']: {results['fused_num_gaussians']}")

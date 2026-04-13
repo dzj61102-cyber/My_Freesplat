@@ -1,4 +1,5 @@
 # 标准库：数据类与类型标注
+# vscode_save_probe_20260325
 from dataclasses import dataclass
 from typing import Literal, Optional, List
 
@@ -45,6 +46,17 @@ class OpacityMappingCfg:
     initial: float
     final: float
     warm_up: int
+
+
+@dataclass
+class BudgetPruningCfg:
+    enabled: bool = True
+    keep_ratio: float = 0.8
+    lambda_budget: float = 0.2
+    lambda_bin: float = 0.02
+    tau_start: float = 0.5
+    tau_end: float = 0.2
+    total_steps: int = 300000
 
 
 UseDepthMode = Literal[
@@ -130,6 +142,7 @@ class EncoderFreeSplatCfg:
     visualizer: EncoderVisualizerEpipolarCfg
     gaussian_adapter: GaussianAdapterCfg
     opacity_mapping: OpacityMappingCfg
+    budget_pruning: BudgetPruningCfg
     
     # 深度离散采样数量（cost volume 深度 bin）
     num_depth_candidates: int = 64
@@ -223,7 +236,7 @@ class EncoderFreeSplat(Encoder[EncoderFreeSplatCfg]):
         # cost volume 构建器：在 1/4 分辨率下做多视角特征匹配
         self.cost_volume = AVGFeatureVolumeManager(matching_height=self.cfg.image_H//4, 
                                                     matching_width=self.cfg.image_W//4,
-                                                    num_depth_bins=self.cfg.num_depth_candidates,
+                                                    num_depth_bins=self.cfg.num_depth_candidates,#深度离散采样的数量
                                                     matching_dim_size=48,)
         # 对 cost volume + backbone 特征做多尺度编码
         self.cv_encoder = CVEncoder(num_ch_cv=self.cfg.num_depth_candidates,
@@ -252,6 +265,25 @@ class EncoderFreeSplat(Encoder[EncoderFreeSplatCfg]):
         # 用于多视角高斯特征融合的循环单元
         self.gru = GRU()
 
+        # 预算感知剪枝的轻量打分头：66 -> 128 -> 64 -> 1
+        self.importance_head = nn.Sequential(
+            nn.Linear(66, 128),
+            nn.GELU(),
+            nn.Linear(128, 64),
+            nn.GELU(),
+            nn.Linear(64, 1),
+        )
+
+    # 温度退火，温度呈指数规律从 tau_start(0.5) 衰减到 tau_end(0.2)
+    def _pruning_temperature(self, global_step: int) -> float:
+        cfg = self.cfg.budget_pruning
+        if cfg.total_steps <= 0:
+            return cfg.tau_end
+        progress = min(max(global_step, 0) / cfg.total_steps, 1.0)
+        tau_start = max(cfg.tau_start, 1e-6)
+        tau_end = max(cfg.tau_end, 1e-6)
+        return tau_start * ((tau_end / tau_start) ** progress)
+
     def map_pdf_to_opacity(
         self,
         pdf: Float[Tensor, " *batch"],
@@ -268,6 +300,313 @@ class EncoderFreeSplat(Encoder[EncoderFreeSplatCfg]):
 
         # 将概率密度映射为不透明度，兼顾低密度与高密度区域梯度
         return 0.5 * (1 - (1 - pdf) ** exponent + pdf ** (1 / exponent))
+
+    # 常规版本
+    def _compute_voxel_size_from_gaussians(
+        self,
+        gs: Gaussians,
+    ) -> tuple[Tensor, Tensor, Tensor]:
+        """按规则计算体素边长（仅前两步：初始值 + 包围盒约束）。
+
+        Returns:
+            (v_limited, v_raw, bbox_diag) 均为标量 Tensor。
+        """
+        means = gs.means
+        covariances = gs.covariances
+        # 兼容输入 [B, G, ...]，测试阶段 B=1。
+        means = means.reshape(-1, means.shape[-2], means.shape[-1])[0]
+        covariances = covariances.reshape(
+            -1, covariances.shape[-3], covariances.shape[-2], covariances.shape[-1]
+        )[0]
+
+        # Step 1: v = 2 * median((x1*x2*x3)^(1/6))
+        eigvals = torch.linalg.eigvalsh(covariances).clamp_min(0.0)
+        scale_proxy = eigvals.prod(dim=-1).clamp_min(1e-24).pow(1.0 / 6.0)
+        m = torch.median(scale_proxy)
+        v_raw = 2.3 * m
+        return v_raw
+
+        # # Step 2: L = ||mu_max - mu_min||_2, 并限制 v 上下限
+        # mu_max = means.max(dim=0).values
+        # mu_min = means.min(dim=0).values
+        # bbox_diag = torch.linalg.norm(mu_max - mu_min, ord=2)
+        # v_min = 0.0001 * bbox_diag
+        # v_max = 0.0002 * bbox_diag
+        # v_limited = torch.clamp(v_raw, min=v_min, max=v_max)
+
+        # # 退化盒子（L≈0）时，保留非零 v_raw，避免后续体素划分除零。
+        # eps = torch.tensor(1e-8, device=v_limited.device, dtype=v_limited.dtype)
+        # v_limited = torch.where(bbox_diag <= eps, torch.clamp_min(v_raw, eps), v_limited)
+        # return v_limited, v_raw, bbox_diag
+    
+    # #30veiw版本
+    # def _compute_voxel_size_from_gaussians(
+    #     self,
+    #     gs: Gaussians,
+    # ) -> tuple[Tensor, Tensor, Tensor]:
+    #     """按规则计算体素边长（初始值 + 包围盒约束），并加入数值稳定性保护。
+
+    #     Returns:
+    #         (v_limited, v_raw, bbox_diag) 均为标量 Tensor。
+    #     """
+    #     means = gs.means
+    #     covariances = gs.covariances
+
+    #     # 兼容输入 [B, G, ...]，测试阶段 B=1。
+    #     means = means.reshape(-1, means.shape[-2], means.shape[-1])[0]              # [G, 3]
+    #     covariances = covariances.reshape(
+    #         -1, covariances.shape[-3], covariances.shape[-2], covariances.shape[-1]
+    #     )[0]                                                                        # [G, 3, 3]
+
+    #     device = means.device
+    #     dtype = means.dtype
+    #     eps = torch.tensor(1e-8, device=device, dtype=dtype)
+
+    #     # ---------------------------
+    #     # Step 0: 基本数值合法性检查
+    #     # ---------------------------
+    #     # Step 0: 基本数值合法性检查
+    #     means_finite_mask = torch.isfinite(means).all(dim=-1)            # [G]
+    #     cov_finite_mask = torch.isfinite(covariances).all(dim=-1).all(dim=-1)  # [G]
+    #     valid_mask = means_finite_mask & cov_finite_mask
+
+    #     # 若存在非法高斯，先过滤掉
+    #     means_valid = means[valid_mask]
+    #     covariances_valid = covariances[valid_mask]
+
+    #     # 如果全部非法，直接给安全回退
+    #     if means_valid.shape[0] == 0:
+    #         # 给一个极小但非零的安全值，避免后续体素划分除零
+    #         fallback = torch.tensor(1e-4, device=device, dtype=dtype)
+    #         return fallback, fallback, torch.tensor(0.0, device=device, dtype=dtype)
+
+    #     # ---------------------------
+    #     # Step 1: 计算 bbox_diag
+    #     # bbox 用 valid means 计算，避免 NaN 传播
+    #     # ---------------------------
+    #     mu_max = means_valid.max(dim=0).values
+    #     mu_min = means_valid.min(dim=0).values
+    #     bbox_diag = torch.linalg.norm(mu_max - mu_min, ord=2)
+
+    #     # ---------------------------
+    #     # Step 2: 计算协方差特征值
+    #     # 先做对称化，减小数值误差
+    #     # ---------------------------
+    #     covariances_valid = 0.5 * (covariances_valid + covariances_valid.transpose(-1, -2))
+
+    #     # eigvalsh 前再次 try/except 兜底
+    #     try:
+    #         eigvals = torch.linalg.eigvalsh(covariances_valid)
+    #     except RuntimeError as e:
+    #         print("[VoxelSize] eigvalsh failed, fallback used.")
+    #         print(f"[VoxelSize] valid cov count: {covariances_valid.shape[0]}")
+    #         print(f"[VoxelSize] bbox_diag: {bbox_diag.item():.8f}")
+    #         fallback = torch.clamp_min(0.0001 * bbox_diag, eps)
+    #         return fallback, fallback, bbox_diag
+
+    #     # 过滤特征值中的 NaN/Inf
+    #     eigvals_finite_mask = torch.isfinite(eigvals).all(dim=-1)                   # [G_valid]
+    #     eigvals = eigvals[eigvals_finite_mask]
+
+    #     if eigvals.shape[0] == 0:
+    #         print("[VoxelSize] No valid eigenvalues, fallback used.")
+    #         fallback = torch.clamp_min(0.0001 * bbox_diag, eps)
+    #         return fallback, fallback, bbox_diag
+
+    #     # 限制为非负，避免轻微数值负值
+    #     eigvals = eigvals.clamp_min(0.0)
+
+    #     # Step 1 in your design:
+    #     # scale_proxy = (x1 * x2 * x3)^(1/6)
+    #     scale_proxy = eigvals.prod(dim=-1).clamp_min(1e-24).pow(1.0 / 6.0)
+
+    #     # 再次过滤非有限 scale_proxy
+    #     scale_proxy = scale_proxy[torch.isfinite(scale_proxy)]
+    #     if scale_proxy.numel() == 0:
+    #         print("[VoxelSize] No valid scale_proxy, fallback used.")
+    #         fallback = torch.clamp_min(0.0001 * bbox_diag, eps)
+    #         return fallback, fallback, bbox_diag
+
+    #     m = torch.median(scale_proxy)
+
+    #     v_raw = 2.0 * m
+
+    #     # Step 2: 包围盒约束
+    #     v_min = 0.0001 * bbox_diag
+    #     v_max = 0.0002 * bbox_diag
+    #     v_limited = torch.clamp(v_raw, min=v_min, max=v_max)
+
+    #     # 退化盒子（L≈0）时，保留非零 v_raw，避免后续体素划分除零
+    #     v_limited = torch.where(bbox_diag <= eps, torch.clamp_min(v_raw, eps), v_limited)
+
+    #     # 最后再保证输出有限且非零
+    #     if not torch.isfinite(v_limited):
+    #         print("[VoxelSize] v_limited invalid, fallback used.")
+    #         v_limited = torch.clamp_min(0.0001 * bbox_diag, eps)
+
+    #     if not torch.isfinite(v_raw):
+    #         print("[VoxelSize] v_raw invalid, set to v_limited.")
+    #         v_raw = v_limited
+
+    #     return v_limited, v_raw, bbox_diag
+
+    def _voxel_aggregate_gaussians(
+        self,
+        gs: Gaussians,
+        scores: Tensor,
+        voxel_size: Tensor,
+        tau: float = 0.5,
+        collect_pending_stats: bool = False,
+    ) -> tuple[Gaussians, Tensor, Tensor, Tensor, Tensor]:
+        """按体素聚合单样本高斯（步骤 3-5）。"""
+        # Step 0: 基本数值合法性检查
+        means = gs.means.reshape(-1, gs.means.shape[-2], gs.means.shape[-1])[0]
+        covariances = gs.covariances.reshape(
+            -1, gs.covariances.shape[-3], gs.covariances.shape[-2], gs.covariances.shape[-1]
+        )[0]
+        harmonics = gs.harmonics.reshape(-1, gs.harmonics.shape[-3], gs.harmonics.shape[-2], gs.harmonics.shape[-1])[0]
+        opacities = gs.opacities.reshape(-1, gs.opacities.shape[-1])[0]
+        scores = scores.reshape(-1, scores.shape[-1])[0]
+
+        eps = torch.tensor(1e-8, device=means.device, dtype=means.dtype)
+        tau_tensor = torch.tensor(max(tau, 1e-6), device=means.device, dtype=means.dtype)
+
+        # Step 3: k_i = floor((mu_i - mu_min) / v)，按体素索引分组。
+        mu_min = means.min(dim=0).values
+        voxel_indices = torch.floor((means - mu_min) / torch.clamp_min(voxel_size, eps)).to(torch.long)
+        _, inverse = torch.unique(voxel_indices, dim=0, return_inverse=True)
+        n_voxels = int(inverse.max().item()) + 1 if inverse.numel() > 0 else 0
+        if n_voxels == 0:
+            empty_stats = torch.zeros(3, device=means.device, dtype=means.dtype)
+            return (
+                gs,
+                scores.unsqueeze(0),
+                torch.tensor(0, device=means.device),
+                empty_stats,
+                torch.zeros(0, device=means.device, dtype=torch.long),
+            )
+
+        counts = torch.bincount(inverse, minlength=n_voxels).to(means.dtype)
+        counts_long = counts.to(torch.long)
+        if collect_pending_stats:
+            per_voxel_pending_gaussians_stats = torch.stack(
+                [counts.mean(), counts.max(), counts.min()]
+            )
+        else:
+            per_voxel_pending_gaussians_stats = torch.zeros(
+                3, device=means.device, dtype=means.dtype
+            )
+
+        # Step 4: 依据用户给定公式计算正值重要性/主导占比/主导索引/聚合权重/自适应融合系数。
+        # r_i = softplus(score_i)
+        pos_scores = torch.nn.functional.softplus(scores)
+        r_sum = torch.zeros(n_voxels, device=means.device, dtype=means.dtype)
+        r_sum.index_add_(0, inverse, pos_scores)
+        # p_i = r_i / sum_j r_j
+        p = pos_scores / torch.clamp_min(r_sum[inverse], eps)
+        # i* = argmax_i p_i,  rho_m = p_{i*}
+        dominant_ratio = torch.full((n_voxels,), -torch.inf, device=means.device, dtype=means.dtype)
+        dominant_ratio.scatter_reduce_(0, inverse, p, reduce="amax", include_self=True)
+        n_gaussians = p.shape[0]
+        gaussian_indices = torch.arange(n_gaussians, device=means.device, dtype=torch.long)
+        dominant_index_candidates = torch.where(
+            p >= (dominant_ratio[inverse] - 1e-12),
+            gaussian_indices,
+            torch.full_like(gaussian_indices, n_gaussians),
+        )
+        dominant_indices = torch.full(
+            (n_voxels,), n_gaussians, device=means.device, dtype=torch.long
+        )
+        dominant_indices.scatter_reduce_(
+            0, inverse, dominant_index_candidates, reduce="amin", include_self=True
+        )
+        dominant_indices = dominant_indices.clamp_max(n_gaussians - 1)
+        # lambda_m = gamma * (1 - rho_m), gamma = 0.5
+        gamma = torch.tensor(0.5, device=means.device, dtype=means.dtype)
+        lambda_m = gamma * (1.0 - dominant_ratio)
+        # w_i = softmax(r_i / tau) (体素内)
+        logits = pos_scores / tau_tensor
+        group_max = torch.full((n_voxels,), -torch.inf, device=means.device, dtype=means.dtype)
+        group_max.scatter_reduce_(0, inverse, logits, reduce="amax", include_self=True)
+        exp_logits = torch.exp(logits - group_max[inverse])
+        group_exp_sum = torch.zeros(n_voxels, device=means.device, dtype=means.dtype)
+        group_exp_sum.index_add_(0, inverse, exp_logits)
+        weights = exp_logits / torch.clamp_min(group_exp_sum[inverse], eps)
+        # ===== 旧实现（按 z-score softmax 直接加权）保留注释，不删除 =====
+        # score_sum = torch.zeros(n_voxels, device=means.device, dtype=means.dtype)
+        # score_sum.index_add_(0, inverse, scores)
+        # score_sq_sum = torch.zeros(n_voxels, device=means.device, dtype=means.dtype)
+        # score_sq_sum.index_add_(0, inverse, scores * scores)
+        # score_mean = score_sum / torch.clamp_min(counts, 1.0)
+        # score_var = (score_sq_sum / torch.clamp_min(counts, 1.0) - score_mean * score_mean).clamp_min(0.0)
+        # score_std = torch.sqrt(score_var + 1e-6)
+        # zscores = (scores - score_mean[inverse]) / score_std[inverse]
+        # logits = zscores / tau_tensor
+        # group_max = torch.full((n_voxels,), -torch.inf, device=means.device, dtype=means.dtype)
+        # group_max.scatter_reduce_(0, inverse, logits, reduce="amax", include_self=True)
+        # exp_logits = torch.exp(logits - group_max[inverse])
+        # group_exp_sum = torch.zeros(n_voxels, device=means.device, dtype=means.dtype)
+        # group_exp_sum.index_add_(0, inverse, exp_logits)
+        # weights = exp_logits / torch.clamp_min(group_exp_sum[inverse], eps)
+        # agg_means = torch.zeros((n_voxels, 3), device=means.device, dtype=means.dtype)
+        # agg_means.index_add_(0, inverse, weights[:, None] * means)
+
+        # Step 5: 体素内聚合（中心/SH 按“主导项 + 自适应残差”融合；协方差/opacity 延续原稳定实现）。
+        # mu'_m = mu_{i*} + lambda_m * sum_i w_i (mu_i - mu_{i*})
+        dominant_means = means.index_select(0, dominant_indices)
+        mean_offsets_to_dominant = means - dominant_means[inverse]
+        weighted_mean_offsets = torch.zeros((n_voxels, 3), device=means.device, dtype=means.dtype)
+        weighted_mean_offsets.index_add_(0, inverse, weights[:, None] * mean_offsets_to_dominant)
+        agg_means = dominant_means + lambda_m[:, None] * weighted_mean_offsets
+
+        # 协方差按二阶矩合成：
+        # Sigma'_m = sum_i w_i * (Sigma_i + (mu_i - mu'_m)(mu_i - mu'_m)^T)
+        mean_offsets = means - agg_means[inverse]
+        outer = mean_offsets[:, :, None] * mean_offsets[:, None, :]
+        second_moment_terms = covariances + outer
+        second_flat = second_moment_terms.reshape(second_moment_terms.shape[0], -1)
+        agg_cov_flat = torch.zeros((n_voxels, second_flat.shape[-1]), device=means.device, dtype=means.dtype)
+        agg_cov_flat.index_add_(0, inverse, weights[:, None] * second_flat)
+        agg_covariances = agg_cov_flat.reshape(n_voxels, 3, 3)
+        agg_covariances = 0.5 * (agg_covariances + agg_covariances.transpose(-1, -2))
+
+        # c'_m = c_{i*} + lambda_m * sum_i w_i (c_i - c_{i*})
+        harmonics_flat = harmonics.reshape(harmonics.shape[0], -1)
+        dominant_harmonics_flat = harmonics_flat.index_select(0, dominant_indices)
+        harmonics_offsets_to_dominant = harmonics_flat - dominant_harmonics_flat[inverse]
+        weighted_harmonics_offsets = torch.zeros(
+            (n_voxels, harmonics_flat.shape[-1]), device=means.device, dtype=means.dtype
+        )
+        weighted_harmonics_offsets.index_add_(
+            0, inverse, weights[:, None] * harmonics_offsets_to_dominant
+        )
+        agg_harmonics_flat = dominant_harmonics_flat + lambda_m[:, None] * weighted_harmonics_offsets
+        agg_harmonics = agg_harmonics_flat.reshape(n_voxels, harmonics.shape[1], harmonics.shape[2])
+
+        alpha = opacities.reshape(-1).clamp(0.0, 1.0 - 1e-6)
+        log_terms = weights * torch.log1p(-alpha)
+        log_prod = torch.zeros(n_voxels, device=means.device, dtype=means.dtype)
+        log_prod.index_add_(0, inverse, log_terms)
+        agg_opacities = (1.0 - torch.exp(log_prod)).clamp(0.0, 1.0 - 1e-6)
+
+        # 每个体素聚合后的重要性分数：softplus(scores) 按聚合权重 w 加权叠加。
+        score_sp = torch.nn.functional.softplus(scores)
+        agg_pos_scores = torch.zeros(n_voxels, device=means.device, dtype=means.dtype)
+        agg_pos_scores.index_add_(0, inverse, weights * score_sp)
+
+        aggregated = Gaussians(
+            agg_means.unsqueeze(0),
+            agg_covariances.unsqueeze(0),
+            agg_harmonics.unsqueeze(0),
+            agg_opacities.unsqueeze(0),
+        )
+        return (
+            aggregated,
+            agg_pos_scores.unsqueeze(0),
+            torch.tensor(n_voxels, device=means.device),
+            per_voxel_pending_gaussians_stats,
+            counts_long,
+        )
     
     def forward(
         self,
@@ -278,12 +617,12 @@ class EncoderFreeSplat(Encoder[EncoderFreeSplatCfg]):
         is_testing: bool = False,
         export_ply: bool = False,
         dataset_name: str = 'scannet',
-    ) -> dict:
+    ) -> dict:#返回值类型注解，返回一个字典
         """前向：多视角输入 -> 深度/高斯表示。
 
-        关键输入字段（context）：
+        关键输入字段（context，输入数据的dict）：
         - image: [B, V, 3, H, W]，归一化图像
-        - intrinsics: [B, V, 3, 3]，归一化内参（相对宽高）
+        - intrinsics: [B, V, 3, 3]，归一化相机内参，每个 batch、每个视角都有一个 3×3 内参矩阵
         - extrinsics: [B, V, 4, 4]，相机外参
         - near/far: 深度范围
         """
@@ -300,36 +639,51 @@ class EncoderFreeSplat(Encoder[EncoderFreeSplatCfg]):
         coords = []
         results = {}
 
+        # 对 backbone 里的每一层都执行一次 set_bn_eval(module)
         # 仅对 backbone 中 BN 层设置训练态（其余层按模型当前模式）
         self.backbone.apply(set_bn_eval)
         # 记录原始图像尺寸，后续融合时会把归一化内参还原到像素坐标系
         context['image_shape'] = (h, w)
-        # 拷贝一份内参并缩放到 1/4 特征分辨率，用于 cost volume 几何投影
+        # 拷贝归一化内参
         context_intrinsics = context['intrinsics'].clone()
+        # 通常相机内参矩阵长这样：
+        # [[fx,  0, cx],
+        # [ 0, fy, cy],
+        # [ 0,  0,  1]]
+        # 把 归一化内参 转换成 1/4分辨率特征图上的像素内参
         context_intrinsics[:,:,0] *= (w // 4)
         context_intrinsics[:,:,1] *= (h // 4)
 
-        # 当前视角索引 0 ~ n_veiws-1
+        # 一维张量，当前视角索引 [0,1,...,n_veiws-1]，并放到 image 同样的设备上
         cur_indices = torch.arange(n_views, device=context['image'].device)
             
         # 根据 cur_indices 收集当前视角的内参、外参、图像
-        # 内参：[batch_size, n_veiws, 3, 3]
-        # 外参[batch_size, n_veiws, 4, 4]
-        # 图像[batch_size*n_veiws,3,h,w]
+        # 内参cur_intrinsics [b, v, 3, 3]
+        # 外参cur_extrinsics [b, v, 4, 4]
+        # 图像cur_image [b*v,3,h,w],把 batch 维和视角维合并，便于统一送进 2D CNN
+
+        # 在视角维上，根据 index 提供的索引取值，index的shape需要和输出一致
+        # cur_indices的shape是[v]，通过view调整为[1,v,1,1]，再在batch维上重复b次，在3x3和4x4维上重复以匹配内外参的形状
         cur_intrinsics = context_intrinsics.gather(dim=1, index=cur_indices.view(1,-1,1,1).repeat(b,1,3,3))
         cur_extrinsics = context['extrinsics'].gather(dim=1, index=cur_indices.view(1,-1,1,1).repeat(b,1,4,4))
         cur_image = context['image'].gather(dim=1, index=cur_indices.view(1,-1,1,1,1).repeat(b,1,3,h,w)).view(-1,3,h,w)
 
-        # 1、获取2D特征，逐 batch 送入 backbone
+        # 1、获取2D特征，
         cur_feats = []
+        # self.backbone 输出的是一个 5 层特征 list（1/2, 1/4, 1/8, 1/16, 1/32 分辨率）
         for bb in range(b):
-            # 提取当前 batch 中全部视角的多尺度特征
-            cur_feats.append(self.backbone(cur_image[bb*n_views:(bb+1)*n_views]))
+            cur_feats.append(self.backbone(cur_image[bb*n_views:(bb+1)*n_views]))# 逐batch送入backbone提取特征，一个batch=一个多视角采样
         
-        # 将各 batch 的同层特征拼接，得到每层 [B*V, C, H, W]
+        # 将各 batch 的同层特征拼接，得到cur_feats，list，长度5
+        # cur_feats每个元素是一个张量，形状如下  C：24-48-64-160-256
+        #   - cur_feats[0]: [B*V, C0, H/2,  W/2 ]
+        #   - cur_feats[1]: [B*V, C1, H/4,  W/4 ]（专门用于匹配）
+        #   - cur_feats[2]: [B*V, C2, H/8,  W/8 ]
+        #   - cur_feats[3]: [B*V, C3, H/16, W/16]
+        #   - cur_feats[4]: [B*V, C4, H/32, W/32]
         cur_feats = [torch.cat([x[l] for x in cur_feats], dim=0) for l in range(len(cur_feats[0]))]
 
-        # full_indices[i,j] = j：用于后续构造每个目标视角对应的源视角集合，视角索引矩阵[v,v]
+        # 视角索引矩阵，形状[v,v]
         full_indices = torch.arange(n_views, device=context['image'].device)[None].repeat(n_views,1)
         
         # 若输入视角数 <= 设定上下文数，则全连接互看；否则按几何距离选局部邻居
@@ -349,27 +703,29 @@ class EncoderFreeSplat(Encoder[EncoderFreeSplatCfg]):
             # 显式去掉自己到自己的连接
             slide_mask[torch.arange(n_views), torch.arange(n_views)] = False
 
-            # 最终 source 索引，shape: [B, V, min(V, num_context_views)-1]
+            # shape: [B, V, num_context_views-1]
             src_indices = full_indices[(~(full_indices == cur_indices[:,None]))*slide_mask].view(1,n_views,min(n_views, num_context_views)-1).repeat(b,1,1)
 
-        
-        # 按 source 索引重排每个 target 视角对应的 source 外参/内参/图像
+        # 最终 source 索引的shape: [B, V, K],K=min(V, num_context_views)-1
+        # 对每个 target 视角 i，按 src_indices[b,i,:] 取出它的K个邻居视角信息：外参/内参/图像
+        # 外参[B, V, K, 4, 4]
         src_extrinsics = context['extrinsics'][:,None].repeat(1,n_views,1,1,1).gather(dim=2, index=src_indices[...,None,None].repeat(1,1,1,4,4))
+        # 内参[B, V, K, 3, 3]
         src_intrinsics = context_intrinsics[:,None].repeat(1,n_views,1,1,1).gather(dim=2, index=src_indices[...,None,None].repeat(1,1,1,3,3))
+        # 图像[B*V, K, 3, H, W]
         src_image = context['image'][:,None].repeat(1,n_views,1,1,1,1).gather(dim=2, index=src_indices[...,None,None,None].repeat(1,1,1,3,h,w))\
                                 .view(-1,n_views-1 if not use_local else min(n_views, num_context_views)-1,3,h,w)
-        # 坐标变换：source<->current 相机坐标系之间的相对位姿
-        src_cam_t_world = src_extrinsics.inverse()
-        cur_cam_t_world = cur_extrinsics.inverse()
-        # 当前相机坐标 -> 源相机坐标
-        src_cam_T_cur_cam = src_cam_t_world @ cur_extrinsics.unsqueeze(2)
-        # 源相机坐标 -> 当前相机坐标
-        cur_cam_T_src_cam = cur_cam_t_world.unsqueeze(2) @ src_extrinsics
 
-        # 匹配特征使用 backbone 的 1/4 分辨率层（cur_feats[1]）,[B*V,C,H/4,W/4]
+        # 坐标变换：source<->current 相机坐标系之间的相对位姿
+        src_cam_t_world = src_extrinsics.inverse()#[B, V, K, 4, 4]（world->src）
+        cur_cam_t_world = cur_extrinsics.inverse()#[B, V, 4, 4]（world->cur）
+        src_cam_T_cur_cam = src_cam_t_world @ cur_extrinsics.unsqueeze(2)#[B, V, K, 4, 4]（cur->src）
+        cur_cam_T_src_cam = cur_cam_t_world.unsqueeze(2) @ src_extrinsics#[B, V, K, 4, 4]（src->cur）
+
+        # 匹配特征使用 backbone 的 1/4 分辨率层（cur_feats[1]）,[B*V,C1,H/4,W/4]
         matching_cur_feats = cur_feats[1]
-        dim = matching_cur_feats.shape[-3] # C
-        # 为每个 target 视角收集对应的 source 特征,[B*V,V-1,C,H/4,W/4]
+        dim = matching_cur_feats.shape[-3] # C1=48
+        # 为每个 target 视角收集对应的 source 特征,[B*V,K,C1,H/4,W/4]
         matching_src_feats = rearrange(cur_feats[1], "(b v) c h w -> b v c h w", b=b, v=n_views)[:,None].repeat(1,n_views,1,1,1,1).\
                             gather(dim=2, index=src_indices[...,None,None,None].repeat(1,1,1,dim,h//4,w//4))\
                             .view(-1,n_views-1 if not use_local else min(n_views, num_context_views)-1,dim,h//4,w//4)
@@ -379,71 +735,133 @@ class EncoderFreeSplat(Encoder[EncoderFreeSplatCfg]):
         cur_cam_T_src_cam_ = rearrange(cur_cam_T_src_cam, 'b v n x y -> (b v) n x y')
         src_intrinsics_ = rearrange(src_intrinsics, 'b v n x y -> (b v) n x y')
         cur_intrinsics_ = rearrange(cur_intrinsics, 'b v x y -> (b v) x y')
-        # 组装 4x4 K 矩阵（只填左上 3x3），便于齐次坐标投影
+
+        # 把 3x3 内参扩成 4x4 齐次形式，便于齐次坐标投影
+        # src视角内参[B*V, K, 4, 4]
         src_K = torch.eye(4, device=context['image'].device)[None,None].repeat(src_intrinsics_.shape[0], src_intrinsics_.shape[1],1,1)
         # 写入每个 source 的 3x3 内参
         src_K[:,:,:3,:3] = src_intrinsics_
+        # cur视角内参[B*V, 4, 4]
         cur_inverse = torch.eye(4, device=context['image'].device)[None].repeat(cur_intrinsics_.shape[0],1,1)
-        # 写入当前视角 K^{-1}
+        # 把 K^{-1} 写到 4x4 左上角，得到 current 相机的齐次逆内参
+        # K 把相机坐标系 3D 点投到像素平面，K^{-1} 反过来把像素坐标 (u,v,1) 变成相机坐标系下的“射线方向
         cur_inverse[:,:3,:3] = cur_intrinsics_.inverse()
         
-        # 使用 batch 中第一个样本的 near/far 作为当前匹配深度范围
+        # 使用 batch 中第一个样本的第一个视角 near/far 作为当前匹配深度范围，[1, 1, 1, 1]
         near = context["near"][:1,0].type_as(src_K).view(1, 1, 1, 1)
         far = context["far"][:1,0].type_as(src_K).view(1, 1, 1, 1)
         
         # 2、构建 cost volume：在每个深度 bin 下做跨视角重投影匹配并聚合
-        cost_volume = self.cost_volume(cur_feats=matching_cur_feats,
-                                        src_feats=matching_src_feats,
-                                        src_extrinsics=src_cam_T_cur_cam_,
-                                        src_poses=cur_cam_T_src_cam_,
-                                        src_Ks=src_K,
-                                        cur_invK=cur_inverse,
+        # cost_volume: [B*V, D, H/4, W/4]，D=128 候选深度数
+        cost_volume = self.cost_volume(cur_feats=matching_cur_feats,#[B*V, C1, H/4, W/4]，当前视角特征
+                                        src_feats=matching_src_feats,#[B*V, K, C1, H/4, W/4]，每个cur对应的 src 特征
+                                        src_extrinsics=src_cam_T_cur_cam_,#当前相机坐标 -> source 相机坐标
+                                        src_poses=cur_cam_T_src_cam_,#source -> 当前相机坐标
+                                        src_Ks=src_K,# src视角内参
+                                        cur_invK=cur_inverse,#current 相机的齐次逆内参
                                         min_depth=near,
                                         max_depth=far,
                                     )
-        
-        # 进一步编码 cost volume，并与主干特征融合后送入深度解码器
+        """
+        cost_volume构建细节：
+        当前像素 (u,v) 在每个候选深度 i 下，投到每个 source 去采样特征，和当前特征做匹配，跨 source 聚合后写回该像素的第 i 个 depth 通道
+        1. 构建深度平面depth_planes
+            shape 为 [B*V, D, H/4, W/4]，其中 D 是深度假设数量
+        2. 当前视角反投影到 3D
+            对第 i 个深度平面 depth_plane[:, i] -> [B*V,1,H/4,W/4]，
+            用当前视角逆内参 cur_invK + 假设深度，将像素反投影到 3D（齐次坐标）：
+            [B*V, 4, (H/4)*(W/4)]（4 是齐次坐标维度）。
+        3. 投影到每个 source 视角
+            用 src内参 和 cur->src 外参，将这些 3D 点投到每个 source，
+            shape [B*V*K, 3, H/4, W/4]（K 是 source 视角数，3表示(u,v,z)信息）。
+            取 z>0 作为有效性 mask：点在 source 相机前方才有效。
+        4. 从 source 特征图采样（warp）
+            用投影得到的 (u,v) 通过 grid_sample 在 source 特征图采样，得到对齐到当前视角的warped source特征：
+            src_feat_warped，shape [B*V, K, C, H/4, W/4]。
+        5. 匹配强度分支（1 通道）
+            src_feat_warped 与 cur_feats 做通道点积（并乘有效 mask），得到
+            [B*V, K, H/4, W/4]；
+            再对 source 维做有效均值，得到
+            [B*V, 1, H/4, W/4]，表示该深度假设下的匹配强度。
+        6. 外观分支（C 通道）
+            对 src_feat_warped 在 source 维做有效均值，得到
+            [B*V, C, H/4, W/4]，表示该深度假设下跨视角聚合后的外观信息。
+        7. 融合并得到该深度平面的响应
+            拼接成 [B*V, C+1, H/4, W/4]，输入 MLP，输出
+            [B*V, 1, H/4, W/4]，表示各视角各像素在第 i 个深度假设下的 learned score（可理解为可信度/代价值特征）。
+        8. 拼接所有深度平面
+            对 i=1..D 的输出在深度维拼接，得到最终 cost volume：
+            [B*V, D, H/4, W/4]，表示每个像素都有一条长度为 D 的深度假设打分曲线。
+        """
+
+        # 把 cost_volume 和 backbone 的多尺度图像特征融合，编码成新的多尺度深度特征
         # list [B*V,64,H/4,W/4] [B*V,128,H/8,W/8] [B*V,256,H/16,W/16] [B*V,384,H/32,W/32]
         cost_volume_features = self.cv_encoder(
-                                cost_volume, 
-                                cur_feats[1:],
+                                cost_volume, #[B*V, D（128）, H/4, W/4]
+                                cur_feats[1:],#list [B*V,48,H/4,W/4] [B*V,64,H/8,W/8] [B*V,160,H/16,W/16] [B*V,256,H/32,W/32]
                             )
-        # 用 CV 编码结果替换原 backbone 对应层作为解码输入
+        # 保留 backbone 最浅层特征（高分辨率纹理层），把其余层替换为 CV 编码后的特征
         # list [B*V,24,H/2,W/2] [B*V,64,H/4,W/4] [B*V,128,H/8,W/8] [B*V,256,H/16,W/16] [B*V,384,H/32,W/32]
         cur_feats = cur_feats[:1] + cost_volume_features
     
-        # 3、获得深度，depth_outputs是一个dict，同时包含多尺度深度、log-depth、深度权重、像素特征等
+        # 3、多尺度深度解码，输出深度和中间特征
+        # dict[str, torch.Tensor]，各 key 含义和 shape 如下：
+        #   - output_pred_s{i}_b1hw (i=0,1,2,3)
+        #       - 含义：第 i 个尺度的解码特征头输出（不是最终深度）
+        #       - shape：[B*V, 65, H/2^(i+1), W/2^(i+1)]， 65 = 1 + 64（1 个深度相关通道 + 64 个像素特征通道）
+        #   - depth_pred_s{i}_b1hw (i=0,1,2,3)
+        #       - 含义：第 i 个尺度的深度图
+        #       - shape：[B*V, 1, H/2^(i+1), W/2^(i+1)]
+        #   - log_depth_pred_s{i}_b1hw (i=0,1,2,3)
+        #       - 含义：第 i 个尺度的对数深度/视差域值（与上面的 depth 一一对应）
+        #       - shape：[B*V, 1, H/2^(i+1), W/2^(i+1)]
+        #   - depth_pred_s-1_b1hw
+        #       - 含义：全分辨率的最终深度图
+        #       - shape：[B*V, 1, H, W]
+        #   - output_pred_s-1_b1hw
+        #       - 含义：全分辨率后的解码特征头输出（第0通道表示密度/不透明度先验/权重,后64通道是高斯特征）
+        #       - shape：[B*V, 65, H, W]
+        #   - depth_weights
+        #       - 含义：全分辨率的深度置信度（取深度候选 softmax 后的最大概率并上采样）
+        #       - shape：[B*V, 1, H, W]
         depth_outputs = self.depth_decoder(cur_feats)
         
-        # 从 RGB 构造高分辨率 skip 特征，补充纹理细节到高斯特征中
-        to_skip = context['image']
-        # 把 [B,V,C,H,W] 合并成 [B*V,C,H,W] 便于 2D 卷积处理
-        to_skip = rearrange(to_skip, "b v c h w -> (b v) c h w")
+        # 把 depth_outputs 拆成几何量（depth/weight/xy）+ 密度 + 外观特征，并全部变成逐像素 token 形式
 
-        # 取第一层跳连分支（不降采样）增强局部细节
+        to_skip = context['image']
+        # 把原始 RGB 从 [B,V,C,H,W] 合并成 [B*V,C,H,W] 便于 2D 卷积处理
+        to_skip = rearrange(to_skip, "b v c h w -> (b v) c h w")
+        # 提取高分辨率纹理特征 [B*V,64,H,W]
         skip = self.high_resolution_skip[0](to_skip)
-        # 每个像素的归一化光线方向/平面坐标
+
+        # 每个像素的归一化 2D 坐标网格（0~1），shape：[H,W,2]
         xy_ray, _ = sample_image_grid((h, w), device)
-        # 取 depth decoder 的 64 维特征（除第一个通道）并还原为 [B,V,H,W,C]
+        # 高斯外观特征，取 depth decoder 的后 64 通道并还原为 [B,V,H,W,64]
         gaussians_feats = rearrange(depth_outputs[f'output_pred_s-1_b1hw'][:,1:], '(b v) c h w -> b v h w c', b=b, v=n_views)
-        # 融合 skip 特征提升局部外观信息，把高分辨率外观信息加到每像素的特征里
+        # 高斯特征 = 高分辨率纹理特征 + 外观特征，增强细节表达，结果仍是 [B,V,H,W,64]
         gaussians_feats = gaussians_feats + rearrange(skip, "(b v) c h w -> b v h w c", b=b, v=n_views)
-        # 第一个通道经过Sigmoid映射到 [0,1]作为密度/置信度density
+
+        # 密度（不透明度先验），第1个通道经Sigmoid映射到 [0,1]，[B,V,H*W,1,1]
         densities = nn.Sigmoid()(rearrange(depth_outputs[f'output_pred_s-1_b1hw'][:,:1], '(b v) c h w -> b v (c h w) () ()', b=b, v=n_views))
-        # 深度与深度权重展平到像素维，便于后续融合[B,V,H*W,1,1]
+        # 深度与深度置信展平成像素序列，便于后续融合[B,V,H*W,1,1]
         depths = rearrange(depth_outputs[f'depth_pred_s-1_b1hw'], "(b v) c h w -> b v (c h w) () ()", b=b)
         weights = rearrange(depth_outputs[f'depth_weights'], "(b v) c h w -> b v (c h w) () ()", b=b)
         
-        # 特征展平为每像素一个 token
-        gaussians_feats = rearrange(gaussians_feats, "b v h w c -> b v (h w) c") # [B,V,H*W,C]
-        xy_ray = rearrange(xy_ray, "h w xy -> (h w) () xy") # [H*W,1,2]
-        # 预留每个 surface 的 xy 偏移（当前初始化为 0）
+        # 高斯特征展平，[B,V,H*W,64]，每个像素一个 token，token 维是高斯特征维
+        gaussians_feats = rearrange(gaussians_feats, "b v h w c -> b v (h w) c") 
+
+        # 像素网格展平，[H*W,1,2]（后续可广播到 [B,V,H*W,1,2]）
+        xy_ray = rearrange(xy_ray, "h w xy -> (h w) () xy") 
+        # 预留每个 surface 的 xy 偏移（当前初始化为 0）,[B,V,H*W,num_surfaces,2]
         offset_xy = torch.zeros_like(rearrange(gaussians_feats[..., :2], "... (srf c) -> ... srf c", srf=self.cfg.num_surfaces),
-                                        device=gaussians_feats.device) # 0,[B,V,H*W,1,2]
-        xy_ray = xy_ray + offset_xy # [B,V,H*W,1,2]
+                                        device=gaussians_feats.device) 
+        # 最终 xy_ray 形状，[B,V,H*W,num_surfaces,2]，支持“一个像素多个 surface 的射线偏移
+        xy_ray = xy_ray + offset_xy 
 
         # 4、获取高斯，单视角高斯解码：像素射线 + 深度 + 密度 + 特征 -> 3D 高斯坐标/属性
-        # 
+
+        # 只返回 means（3D坐标）,shape[B, V, H*W, num_surfaces, 3]
+        # coords[0] 的语义是：每个 batch、每个视角、每个像素（及每个 surface）的初始 3D 点
         coords.append(self.gaussian_adapter.forward(
                     rearrange(context["extrinsics"], "b v i j -> b v () () () i j"),
                     rearrange(context["intrinsics"], "b v i j -> b v () () () i j"),
@@ -454,71 +872,91 @@ class EncoderFreeSplat(Encoder[EncoderFreeSplatCfg]):
                     (h, w),
                     fusion=True,
                 ))
-        # 暂存每像素高斯特征，后续做跨视角融合
+        # 暂存每像素高斯特征，shape: [B, V,  H*W, 64],（来自深度解码器+skip特征）后续做跨视角融合
         gaussians.append(gaussians_feats)
 
-        # 记录 finest scale 深度预测（供损失与可视化）
-        results[f'depth_num0_s-1'] = depths
+        # 把全分辨率和多尺度深度图，以及可能存在的真实深度图和有效区域掩码，统一整理到 results 字典里，方便后续算 loss、做可视化、做评估
+        # 保存全分辨率深度图，展平格式，[B,V,H*W,1,1]
+        results[f'depth_num0_s-1'] = depths 
         try:
-            # 若 GT 深度存在，保存原始深度与有效掩码
+            # 若真实深度存在，保存原始深度与有效掩码，展平格式
             depths_raw = rearrange(context[f'depth_s-1'], "b v c h w -> b v (h w) c 1")
             results[f'depth_num0_s-1_raw'] = depths_raw
             mask = (depths_raw > 1e-3) * (depths_raw < 10)
             results[f'depth_num0_s-1_mask'] = mask
         except:
             pass
-        results[f'depth_num0_s-1_b1hw'] = depth_outputs[f'depth_pred_s-1_b1hw']
+        # 保存全分辨率深度图，图像格式，[B*V, 1, H, W]
+        results[f'depth_num0_s-1_b1hw'] = depth_outputs[f'depth_pred_s-1_b1hw'] 
 
         # 保存多尺度深度结果（s0..s3）
         for s in range(self.max_depth):
-            # 保存展平后的第 s 层深度
+            # 保存多尺度深度，展平格式，[B*V, 1, H/2^(s+1), W/2^(s+1),1,1]
             results[f'depth_num0_s{s}'] = rearrange(depth_outputs[f'depth_pred_s{s}_b1hw'], "(b v) c h w -> b v (c h w) () ()", b=b)
-
             # 读取 log-depth（当前仅保留变量，便于后续扩展）
             log_depths = depth_outputs[f'log_depth_pred_s{s}_b1hw']
-            # 读取原始 depth map（B*V,1,H,W）
+            # 读取原始第 s 层深度，[B*V,1,H/2^(s+1), W/2^(s+1)]
             depths = depth_outputs[f'depth_pred_s{s}_b1hw']
             try:
-                # 若有监督深度，则拉平成同尺度 map
+                # 若多尺度真实深度存在，保存多尺度原始深度与有效掩码，展平格式
                 depths_raw = rearrange(context[f'depth_s{s}'], "b v c h w -> (b v) c h w")
                 results[f'depth_num0_s{s}_raw_b1hw'] = depths_raw
-                # 有效深度区间掩码（过滤 0 与远距噪声）
                 mask = (depths_raw > 1e-3) * (depths_raw < 10)
                 results[f'depth_num0_s{s}_mask_b1hw'] = mask
             except:
                 pass
-            
-            # 保存该尺度可视化形式的深度
+            # 保存多尺度深度，图像格式，[B*V,1,H/2^(s+1), W/2^(s+1)]
             results[f'depth_num0_s{s}_b1hw'] = depths
                         
-        # 5、高斯融合，对 batch 中每个样本独立做多视角高斯融合
-        our_gaussians = []
-        num_raw_gaussians = gaussians[0].shape[2] * gaussians[0].shape[1]
-        B = gaussians[0].shape[0]
+
+        # 5、高斯融合，逐样本
+        # 把多视角、多个尺度产生的大量高斯点，按每个 batch 样本分别做“去重+融合”，再把融合后的结果整理成标准的 Gaussians 表示，最后存进 results 返回
+        our_gaussians = []#每个 batch 样本融合后的高斯结果
+        fused_features = []#每个样本的全局融合特征（与最终高斯一一对应）
+        fused_weights = []#每个样本的全局融合权重（与最终高斯一一对应）
+        num_raw_gaussians = gaussians[0].shape[2] * gaussians[0].shape[1]#融合前原始高斯数量V*H*W
+        B = gaussians[0].shape[0]#B
         for b in range(B):
-            # 取单个样本的高斯特征序列
-            cur_gs = [x[b:b+1] for x in gaussians]
-            # 取单个样本的高斯坐标序列
-            cur_coords = [x[b:b+1] for x in coords]
-            # 取单个样本的密度与深度权重
-            cur_densities = densities[b:b+1]
-            cur_weights = weights[b:b+1]
-            # 取单个样本最细尺度深度图
-            cur_depth = rearrange(depth_outputs[f'depth_pred_s-1_b1hw'], "(b v) c h w -> b v c h w", b=B)[b]
+            # 取当前样本需要融合的数据
+            # 高斯特征[1, V,  H*W, 64]
+            cur_gs = [x[b:b+1] for x in gaussians] #gaussians[0]的shape:[B, V,  H*W, 64]
+            # 3D坐标[1, V, H*W, num_surfaces, 3]
+            cur_coords = [x[b:b+1] for x in coords] #coords[0]的shape:[B, V, H*W, num_surfaces, 3]
+            # 密度[1,V,H*W,1,1]
+            cur_densities = densities[b:b+1] #densities的shape:[B,V,H*W,1,1]
+            # 深度权重[1,V,H*W,1,1]
+            cur_weights = weights[b:b+1] #weights的shape:[B,V,H*W,1,1]
+            # 全分辨率深度图[V,1,H,W]
+            cur_depth = rearrange(depth_outputs[f'depth_pred_s-1_b1hw'], "(b v) c h w -> b v c h w", b=B)[b]#[B*V,1,H,W]->[B,V,1,H,W]
             
             # 按几何一致性融合：返回融合后特征/坐标/外参/深度
-            cur_gaussians, cur_coords, cur_extrinsics, cur_depths = self.fuse_gaussians(cur_gs, cur_coords, 
-                                            cur_densities, cur_weights, 
-                                            cur_depth, 
-                                            context["extrinsics"][b:b+1], \
-                                            context["intrinsics"][b:b+1], context['image_shape'])
+            (
+                cur_gaussians,
+                cur_coords,
+                cur_extrinsics,
+                cur_depths,
+                cur_fused_densities,
+            ) = self.fuse_gaussians(
+                cur_gs,
+                cur_coords,
+                cur_densities,
+                cur_weights,
+                cur_depth,
+                context["extrinsics"][b:b+1],
+                context["intrinsics"][b:b+1],
+                context['image_shape'],
+            )
+            # 记录融合后的全局特征（在映射到高斯参数之前）
+            cur_fused_features = cur_gaussians
 
-            # 将融合特征映射成高斯参数，并再次走 gaussian_adapter 得到标准 Gaussians 结构
+            # 将融合特征映射成高斯参数
             cur_gaussians_now = rearrange(
                             self.to_gaussians(cur_gaussians),
                             "... (srf c) -> ... srf c",
                             srf=self.cfg.num_surfaces,
                         )
+
+            # 通过高斯参数生成标准 Gaussians 对象            
             cur_gaussians = self.gaussian_adapter.forward(
                 # 每个融合点都有对应的融合外参
                 rearrange(cur_extrinsics, "b r i j -> b () r () () i j"),
@@ -537,14 +975,22 @@ class EncoderFreeSplat(Encoder[EncoderFreeSplatCfg]):
                 # 传入融合后坐标，避免重复反投影
                 coords=rearrange(cur_coords, "b r c -> b () r () () c"),
             )
-            # 收集该样本最终高斯对象
+            # 保存当前样本的全局高斯对象，our_gaussians = [样本0的高斯, 样本1的高斯, ...]
             our_gaussians.append(cur_gaussians)
-        # 融合前后高斯数量比例，可用于监控重复点剔除效果
-        num_gaussians = our_gaussians[0].means.shape[2]
+            # 保留融合中间量，供后续按同索引访问每个全局高斯
+            fused_features.append(cur_fused_features)
+            fused_weights.append(cur_fused_densities)
+            
+        # 统计融合效果
+        # 融合前后高斯数量和压缩率
+        num_gaussians = int(sum(int(gs.means.shape[2]) for gs in our_gaussians))
         results['gs_ratio'] = num_gaussians / num_raw_gaussians
-        gaussians = cur_gaussians
- 
-        results['num_gaussians'] = num_gaussians
+        gaussians = cur_gaussians #把 gaussians 赋成了最后一个样本的 cur_gaussians
+        # 统一口径：始终表示 PTF 融合后、任何后处理（体素聚合/剪枝）前的高斯数量。
+        results['fused_num_gaussians'] = num_gaussians
+
+
+        # 准备可视化数据
         visualization_dump = {}
         try:
             # 展平用于可视化的 scale / rotation
@@ -561,10 +1007,9 @@ class EncoderFreeSplat(Encoder[EncoderFreeSplatCfg]):
         
         results['visualizations'] = visualization_dump
 
-        # 每个样本输出一个 Gaussians 对象（展开 v/r/srf/spp 维）
+        # 把每个样本的高斯对象展平，得到一个样本里所有高斯点的总列表
         final_gs = []
         for i in range(len(our_gaussians)):
-            # 将每个样本的结构化高斯字段统一展平
             final_gs.append(Gaussians(
                 rearrange(
                     our_gaussians[i].means,
@@ -583,7 +1028,90 @@ class EncoderFreeSplat(Encoder[EncoderFreeSplatCfg]):
                     "b v r srf spp -> b (v r srf spp)",
                 ),
             ))
+        fused_weights_flat = [rearrange(x, "b g () () -> b g") for x in fused_weights]
         results['gaussians'] = final_gs
+        # 与 results['gaussians'] 同列表顺序、同高斯索引的一一对应附加属性
+        results['gaussians_fused_features'] = fused_features
+        results['gaussians_fused_weights'] = fused_weights_flat
+        # - 对于每个样本 i，高斯索引 g 一一对应：
+        # - results['gaussians'][i].means[:, g, ...] / covariances / harmonics / opacities
+        # - results['gaussians_fused_features'][i][:, g, ...]
+        # - results['gaussians_fused_weights'][i][:, g]
+        # 例：对于样本scene0000_01_0：
+        # results['gs_ratio']: 0.5598941379123263
+        # results['fused_num_gaussians']: 330239（融合后高斯数量）
+        # results['gaussians'][0].means shape: torch.Size([1, 330239, 3])
+        # results['gaussians'][0].covariances shape: torch.Size([1, 330239, 3, 3])
+        # results['gaussians'][0].harmonics shape: torch.Size([1, 330239, 3, 9])
+        # results['gaussians'][0].opacities shape: torch.Size([1, 330239])
+        # results['gaussians_fused_features'][0] shape: torch.Size([1, 330239, 64])
+        # results['gaussians_fused_weights'][0] shape: torch.Size([1, 330239])
+
+        # 在 train/val/test 统一执行与测试阶段一致的体素聚合流程。
+        # test_voxel_size = []
+        # test_voxel_size_raw = []
+        # test_bbox_diag = []
+        test_num_gaussians_aggregated = []
+        test_voxel_pending_gaussians_stats = []
+        test_voxel_gaussian_counts_per_voxel = []
+        aggregated_gs = []
+        aggregated_scores = []
+        for idx, gs in enumerate(final_gs):
+            v_limited = self._compute_voxel_size_from_gaussians(gs)
+            # v_limited, v_raw, bbox_diag = self._compute_voxel_size_from_gaussians(gs)
+            # test_voxel_size.append(v_limited)
+            # test_voxel_size_raw.append(v_raw)
+            # test_bbox_diag.append(bbox_diag)
+
+            if self.cfg.budget_pruning.enabled:
+                feat = fused_features[idx]
+                weight = fused_weights_flat[idx]
+                z = torch.cat(
+                    [feat, torch.log1p(weight).unsqueeze(-1), gs.opacities.unsqueeze(-1)],
+                    dim=-1,
+                )
+                scores = self.importance_head(z).squeeze(-1)
+            else:
+                # 若未启用 learned score，则回退到 opacity 作为重要性分数。
+                scores = gs.opacities
+
+            gs_agg, s_agg, n_agg, c_stats, counts_per_voxel = self._voxel_aggregate_gaussians(
+                gs, scores, v_limited, tau=0.5, collect_pending_stats=is_testing
+            )
+            aggregated_gs.append(gs_agg)
+            aggregated_scores.append(s_agg)
+            test_num_gaussians_aggregated.append(n_agg)
+            if is_testing:
+                test_voxel_pending_gaussians_stats.append(c_stats)
+                test_voxel_gaussian_counts_per_voxel.append(counts_per_voxel)
+
+        final_gs = aggregated_gs
+        results["gaussians"] = final_gs
+        results["gaussians_importance_scores"] = aggregated_scores
+        # 注意：不再在体素聚合后覆盖 results["fused_num_gaussians"]，
+        # 保持其“PTF 融合后、后处理前”的固定语义。
+        # results["test_voxel_size"] = test_voxel_size
+        # results["test_voxel_size_raw"] = test_voxel_size_raw
+        # results["test_bbox_diag"] = test_bbox_diag
+        results["test_num_gaussians_aggregated"] = test_num_gaussians_aggregated
+        if is_testing:
+            results["test_voxel_pending_gaussians_stats"] = test_voxel_pending_gaussians_stats
+            results["test_voxel_gaussian_counts_per_voxel"] = test_voxel_gaussian_counts_per_voxel
+        # 打印
+        # print(f"[EncoderFreeSplat] results['gs_ratio']: {results['gs_ratio']}")
+        # print(f"[EncoderFreeSplat] results['fused_num_gaussians']: {results['fused_num_gaussians']}")
+
+        # for idx, gs in enumerate(results['gaussians']):
+        #     print(f"[EncoderFreeSplat] results['gaussians'][{idx}].means shape: {gs.means.shape}")
+        #     print(f"[EncoderFreeSplat] results['gaussians'][{idx}].covariances shape: {gs.covariances.shape}")
+        #     print(f"[EncoderFreeSplat] results['gaussians'][{idx}].harmonics shape: {gs.harmonics.shape}")
+        #     print(f"[EncoderFreeSplat] results['gaussians'][{idx}].opacities shape: {gs.opacities.shape}")
+    
+        # for idx, x in enumerate(results['gaussians_fused_features']):
+        #     print(f"[EncoderFreeSplat] results['gaussians_fused_features'][{idx}] shape: {x.shape}")
+      
+        # for idx, x in enumerate(results['gaussians_fused_weights']):
+        #     print(f"[EncoderFreeSplat] results['gaussians_fused_weights'][{idx}] shape: {x.shape}")
 
         return results
 
@@ -600,22 +1128,24 @@ class EncoderFreeSplat(Encoder[EncoderFreeSplatCfg]):
         Args:
             depth_thres: 最小深度容差（米），实际阈值为 max(0.05*depth, depth_thres)。
         """
-        # 视角长度 V（此处 gaussians[0] 形状近似 [1, V, HW, C]）
+        # 视角长度 V（ gaussians[0] 形状 [1, V, HW, 64]）
         length = gaussians[0].shape[1]
         # 以第 0 个视角初始化全局高斯池
-        global_gaussians = gaussians[0][:,0]
+        global_gaussians = gaussians[0][:,0]#[1,HW,64]
         global_densities = densities[:, 0]
         global_weight_emb = weight_emb[:, 0]
         global_coords = coords[0][:,0,:,0,0]
-        # 每个高斯关联一个“来源外参”，后续融合时也做加权更新
-        global_extrinsics = extrinsics[:,0][:,None].repeat(1,global_gaussians.shape[1],1,1)
-        depths = rearrange(depths, "v c h w -> v (c h w)")
+        # 每个高斯关联一个“来源外参”，后续融合时做加权更新，用第 0 个视角的外参初始化
+        global_extrinsics = extrinsics[:,0][:,None].repeat(1,global_gaussians.shape[1],1,1)#[1, HW, 4, 4]
+        depths = rearrange(depths, "v c h w -> v (c h w)")#[V 1 H W] ->[V HW]
         # 初始化全局深度缓存
-        global_depths = depths[None, 0]
+        global_depths = depths[None, 0]#[1, HW]
 
-        # 读取像素级高宽，用于投影落点合法性判断
+        # 从第 1 个视角开始，逐个和全局池融合
         h, w = image_shape
         for i in range(1, length):
+            # extrinsic：描述当前相机在世界中的位置和姿态
+            # intrinsic：描述相机的成像参数
             # 当前待融合视角的相机参数
             extrinsic = extrinsics[0,i]
             intrinsic = intrinsics[0,i].clone()
@@ -635,26 +1165,31 @@ class EncoderFreeSplat(Encoder[EncoderFreeSplatCfg]):
             post_xy_coords = (post_xy_coords / curr_depths)[:2].permute(1,0)
             curr_depths = curr_depths.squeeze()
             post_xy_coords = post_xy_coords * focal_length_mat.reshape(1,2) + principal_point_mat # [196608, 2]
+            #  全局 3D 点投影所得像素坐标[N, 2]，N表示全局高斯点数量，2表示y,x
             pixel_coords = post_xy_coords.round().long()[:,[1,0]]
-            # 仅保留落在图像内且深度为正的投影点
+            # 落在图像内且深度为正，为有效投影点
             valid = (pixel_coords[:, 0] >= 0) & (pixel_coords[:, 0] < h) & (pixel_coords[:, 1] >= 0) & (pixel_coords[:, 1] < w) & (curr_depths > 0)
             proj_map = - torch.ones((h*w), device=coords[0].device, dtype=curr_depths.dtype)
             # 初始化深度图为大值，后续通过 scatter_reduce 取最小深度
             depth_map = torch.ones((h*w), device=coords[0].device, dtype=curr_depths.dtype) * 10000
 
-            # 对同一像素多个投影，保留最近深度（z-buffer）
+            # 有效投影点在图像展平后的像素编号，shape：[N_valid]，pixel_indices[k]表示第 k 个合法投影点，落在当前图像展平后的第几个像素位置
             pixel_indices = (pixel_coords[:, 1] + pixel_coords[:, 0]*w)[valid]
             depth_map.scatter_reduce_(0, pixel_indices, curr_depths[valid], reduce='amin')
 
-            # 深度一致性掩码：|z_proj - z_cur| < max(0.05*z_cur, depth_thres)
+            # 深度一致性掩码：|全局池投影到当前视角后的深度-当前视角自己的深度| < max(0.05*z_cur, depth_thres)，最小误差阈值不能低于 depth_thres
             fusion_mask = torch.abs(depth_map - depths[i]) < torch.clamp_min(depths[i] * 0.05, depth_thres)
 
-            # proj_map: 仅记录“最近点”对应索引；fusion_indices: 满足深度一致性索引
+            # 可融合对应点判定，同时满足：是投影到该像素的最近点+和当前视角深度一致
+            # 合法投影点中，最近点索引 
             proj_map = torch.where(depth_map[pixel_indices] == curr_depths[valid])[0]
+            # 合法投影点中，满足深度一致性的点索引
             fusion_indices = torch.where(fusion_mask[pixel_indices])[0]
-            # 二者取交集，得到真正可融合的一一对应
+            # 合法投影点中，同时满足最近 + 深度一致性的点索引
             fusion_indices_ = fusion_indices[torch.isin(fusion_indices, proj_map)]
+            # 全局投影点中，同时满足最近 + 深度一致性的点索引，即最终真正和当前视角建立一一对应关系的点索引
             corr_indices = proj_map[torch.isin(proj_map, fusion_indices)]
+            # 全局投影点中，有效投影点的索引
             valid_indices = torch.zeros(valid.sum(), device=valid.device, dtype=torch.bool)
             valid_indices.scatter_(0, corr_indices, True)
             mask = torch.zeros_like(valid, device=valid.device, dtype=torch.bool)
@@ -666,11 +1201,22 @@ class EncoderFreeSplat(Encoder[EncoderFreeSplatCfg]):
             mask = torch.zeros_like(valid, device=valid.device, dtype=torch.bool)
             mask[valid] = valid_indices
 
+            # 如果存在可融合点，就开始融合
+            # 显式几何加权平均：主要看 densities
+            # 特征融合/GRU 更新：weights 作为辅助输入一起参与
+
             if mask.sum() > 0:
-                # 用两路密度/权重构造 PE 嵌入，作为 GRU 门控的条件
+                # 把密度和权重做位置编码后送给 GRU，当成门控条件
+                # 当前视角的新点对应的权重/密度信息编码
                 input_weights_emb = positional_encoding(torch.cat([global_densities[:, mask], weight_emb[:, i, pixel_indices][:,fusion_indices_]], dim=-1), 6)
+                # 当前全局池中旧点对应的权重/密度信息编码
                 hidden_weights_emb = positional_encoding(torch.cat([densities[:, i, pixel_indices][:,fusion_indices_], global_weight_emb[:, mask]], dim=-1), 6)
                 # GRU 融合“当前视角特征”和“全局特征”
+                # 为什么用 GRU
+                # GRU 本来是序列模型，但这里作者把它当成一种“带门控的特征更新器”：
+                # 保留旧信息多少
+                # 接纳新信息多少
+                # 如何平衡两者
                 fusion_feat = self.gru(gaussians[0][:, i, pixel_indices][:,fusion_indices_].unsqueeze(2),
                                        global_gaussians[:, mask].unsqueeze(2),
                                        input_weights_emb,
@@ -682,7 +1228,7 @@ class EncoderFreeSplat(Encoder[EncoderFreeSplatCfg]):
                 weights_0 = global_densities[:, mask].repeat(1, 1, 1, 2)
                 weights_1 = densities[:, i, pixel_indices][:,fusion_indices_].repeat(1, 1, 1, 2)
 
-                # 位置、密度、权重嵌入、外参、深度做加权融合
+                # 位置、密度（权重）、深度权重（置信度）、外参、深度做加权融合，(旧值 * 旧权重 + 新值 * 新权重) / (旧权重 + 新权重)
                 global_coords = torch.cat([global_coords[:, ~mask], (global_coords[:, mask]*weights_0[...,1] +
                                                 coords[0][:, i, pixel_indices][:,fusion_indices_,0,0]*weights_1[...,1]) / (weights_0[...,1]+weights_1[...,1])], dim=1)
                 global_densities = torch.cat([global_densities[:, ~mask], (global_densities[:, mask] +
@@ -696,6 +1242,7 @@ class EncoderFreeSplat(Encoder[EncoderFreeSplatCfg]):
                                                         depths[None, i, pixel_indices][:,fusion_indices_]*weights_1[...,0,0])/(weights_0[...,0,0]+weights_1[...,0,0])], dim=1)
             
             # 把当前视角中未通过融合匹配的点直接追加到全局池
+            # 特征、位置、密度、深度权重、外参、深度
             global_gaussians = torch.cat([global_gaussians, gaussians[0][:,i]\
                                                 [:,~fusion_mask]], dim=1)
             global_coords = torch.cat([global_coords, coords[0][:,i]\
@@ -709,5 +1256,5 @@ class EncoderFreeSplat(Encoder[EncoderFreeSplatCfg]):
             global_depths = torch.cat([global_depths, depths[None,i]\
                                                 [:,~fusion_mask]], dim=1)
 
-        # 返回融合后的特征、坐标、外参、深度
-        return global_gaussians, global_coords, global_extrinsics, global_depths
+        # 返回融合后的特征、坐标、外参、深度和融合权重
+        return global_gaussians, global_coords, global_extrinsics, global_depths, global_densities
