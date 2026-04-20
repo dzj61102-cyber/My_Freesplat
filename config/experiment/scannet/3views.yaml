@@ -33,7 +33,7 @@ loss:
     weight: 0.05
 
 trainer:
-  max_steps: 150_001
+  max_steps: 200_001
 
 train:
   has_depth: true

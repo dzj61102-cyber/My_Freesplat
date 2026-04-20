@@ -261,6 +261,7 @@ class OptimizerCfg:
 class TestCfg:
     output_path: Path
     visualize_voxel: bool = False
+    measure_decoder_peak_memory: bool = False
 
 
 @dataclass
@@ -270,6 +271,10 @@ class TrainCfg:
     extended_visualization: bool
     has_depth: bool = False
     train_only_importance_head: bool = False #仅训练 Importance Head 开关配置项
+    importance_head_lr: float = 1e-4
+    to_gaussians_lr: float = 1e-5
+    depth_decoder_lr: float = 1e-5
+    high_resolution_skip0_lr: float = 1e-5
 
 
 @runtime_checkable
@@ -331,6 +336,8 @@ class ModelWrapper(LightningModule):
         self.benchmarker = Benchmarker()
 
         self.losses_log = {}
+        self.test_decoder_peak_memory_bytes: list[float] = []
+        self.test_peak_memory_bytes_accum: float = 0.0
         # 先全冻结，再仅解冻 self.encoder.importance_head 与 self.encoder.to_gaussians
         if self.train_cfg.train_only_importance_head:
             for param in self.parameters():
@@ -345,9 +352,23 @@ class ModelWrapper(LightningModule):
                 raise ValueError(
                     "train.train_only_importance_head=true but encoder has no to_gaussians."
                 )
+            depth_decoder = getattr(self.encoder, "depth_decoder", None)
+            if depth_decoder is None or not hasattr(depth_decoder, "conv_last"):
+                raise ValueError(
+                    "train.train_only_importance_head=true but encoder has no depth_decoder.conv_last."
+                )
+            high_resolution_skip = getattr(self.encoder, "high_resolution_skip", None)
+            if high_resolution_skip is None or len(high_resolution_skip) == 0:
+                raise ValueError(
+                    "train.train_only_importance_head=true but encoder has no high_resolution_skip[0]."
+                )
             for param in importance_head.parameters():
                 param.requires_grad = True
             for param in to_gaussians.parameters():
+                param.requires_grad = True
+            for param in depth_decoder.conv_last.parameters():
+                param.requires_grad = True
+            for param in high_resolution_skip[0].parameters():
                 param.requires_grad = True
             # 打印可训练参数名预览   
             trainable_names = [
@@ -384,6 +405,10 @@ class ModelWrapper(LightningModule):
                     print(f'    {k2}: {cfg_dict[k1][k2]}')
             except:
                 print(f'{k1}: {cfg_dict[k1]}')
+
+    def on_test_start(self) -> None:
+        self.test_decoder_peak_memory_bytes = []
+        self.test_peak_memory_bytes_accum = 0.0
 
     def on_load_checkpoint(self, checkpoint: dict) -> None:
         state_dict = checkpoint["state_dict"]
@@ -543,6 +568,12 @@ class ModelWrapper(LightningModule):
             fused_num_gaussians = float(encoder_results.get("fused_num_gaussians", float("nan")))
             rendered_num_gaussians = count_gaussians(gaussians)
             
+        if self.test_cfg.measure_decoder_peak_memory and torch.cuda.is_available():
+            current_peak = float(torch.cuda.memory_stats()["allocated_bytes.all.peak"])
+            self.test_peak_memory_bytes_accum = max(self.test_peak_memory_bytes_accum, current_peak)
+            torch.cuda.synchronize()
+            torch.cuda.reset_peak_memory_stats()
+
         with self.benchmarker.time("decoder", num_calls=v):
             if not isinstance(gaussians, list):
                 output = self.decoder.forward(
@@ -579,6 +610,9 @@ class ModelWrapper(LightningModule):
                     output.depth = torch.cat([x.depth for x in output_list], dim=0)
                 except:
                     pass
+        if self.test_cfg.measure_decoder_peak_memory and torch.cuda.is_available():
+            torch.cuda.synchronize()
+            self.test_decoder_peak_memory_bytes.append(float(torch.cuda.max_memory_allocated()))
 
         # Save images.
         (scene,) = batch["scene"]
@@ -718,9 +752,6 @@ class ModelWrapper(LightningModule):
     def on_test_end(self) -> None:
         name = get_cfg()["wandb"]["name"]
         self.benchmarker.dump(self.test_cfg.output_path / name / "benchmark.json")
-        self.benchmarker.dump_memory(
-            self.test_cfg.output_path / name / "peak_memory.json"
-        )
         self.benchmarker.dump_stats(
             self.test_cfg.output_path / name / "stats.json"
         )
@@ -763,7 +794,25 @@ class ModelWrapper(LightningModule):
             else float("nan")
         )
         fps = (1.0 / mean_decoder_time) if np.isfinite(mean_decoder_time) and mean_decoder_time > 0 else float("nan")
-        peak_memory_bytes = torch.cuda.memory_stats()["allocated_bytes.all.peak"] if torch.cuda.is_available() else 0.0
+        if torch.cuda.is_available():
+            current_peak = float(torch.cuda.memory_stats()["allocated_bytes.all.peak"])
+            if self.test_cfg.measure_decoder_peak_memory:
+                peak_memory_bytes = max(self.test_peak_memory_bytes_accum, current_peak)
+                decoder_peak_memory_gb_max = (
+                    max(self.test_decoder_peak_memory_bytes) / (1024 ** 3)
+                    if len(self.test_decoder_peak_memory_bytes) > 0
+                    else float("nan")
+                )
+            else:
+                peak_memory_bytes = current_peak
+                decoder_peak_memory_gb_max = float("nan")
+        else:
+            peak_memory_bytes = 0.0
+            decoder_peak_memory_gb_max = float("nan")
+        self.benchmarker.dump_memory(
+            self.test_cfg.output_path / name / "peak_memory.json",
+            peak_memory_bytes=float(peak_memory_bytes),
+        )
         peak_memory_gb = peak_memory_bytes / (1024 ** 3)
         summary_metrics = {}
         def log_metric(key, value, decimals=3):
@@ -804,6 +853,8 @@ class ModelWrapper(LightningModule):
         # log_metric('gs_ratio_avg', self.benchmarker.benchmarks.get("gs_ratio_avg", float("nan")))
         # log_metric('gaussian_retention_ratio_avg', gaussian_retention_ratio_avg)
         log_metric('peak_memory_gb', peak_memory_gb)
+        if self.test_cfg.measure_decoder_peak_memory:
+            log_metric('decoder_peak_memory_gb_max', decoder_peak_memory_gb_max)
         log_metric('mean_encoder_time', mean_encoder_time, decimals=6)
         log_metric('mean_decoder_time', mean_decoder_time, decimals=6)
         log_metric('mean_encoder_decoder_time_sum', mean_encoder_decoder_time_sum, decimals=6)
@@ -1166,23 +1217,59 @@ class ModelWrapper(LightningModule):
         if self.train_cfg.train_only_importance_head:
             importance_head = getattr(self.encoder, "importance_head", None)
             to_gaussians = getattr(self.encoder, "to_gaussians", None)
-            if importance_head is None or to_gaussians is None:
+            depth_decoder = getattr(self.encoder, "depth_decoder", None)
+            high_resolution_skip = getattr(self.encoder, "high_resolution_skip", None)
+            if (
+                importance_head is None
+                or to_gaussians is None
+                or depth_decoder is None
+                or not hasattr(depth_decoder, "conv_last")
+                or high_resolution_skip is None
+                or len(high_resolution_skip) == 0
+            ):
                 raise ValueError(
-                    "train_only_importance_head mode requires encoder.importance_head and encoder.to_gaussians."
+                    "train_only_importance_head mode requires encoder.importance_head, "
+                    "encoder.to_gaussians, encoder.depth_decoder.conv_last and encoder.high_resolution_skip[0]."
                 )
             importance_params = [p for p in importance_head.parameters() if p.requires_grad]
             to_gaussians_params = [p for p in to_gaussians.parameters() if p.requires_grad]
-            if len(importance_params) == 0 or len(to_gaussians_params) == 0:
+            depth_decoder_params = [p for p in depth_decoder.conv_last.parameters() if p.requires_grad]
+            high_resolution_skip0_params = [p for p in high_resolution_skip[0].parameters() if p.requires_grad]
+            if (
+                len(importance_params) == 0
+                or len(to_gaussians_params) == 0
+                or len(depth_decoder_params) == 0
+                or len(high_resolution_skip0_params) == 0
+            ):
                 raise ValueError(
-                    "No trainable parameters found in importance_head/to_gaussians."
+                    "No trainable parameters found in one of: importance_head, to_gaussians, "
+                    "depth_decoder.conv_last, high_resolution_skip[0]."
                 )
             param_groups = [
-                {"params": importance_params, "lr": 1e-4},
-                {"params": to_gaussians_params, "lr": 1e-5},
+                {"params": importance_params, "lr": self.train_cfg.importance_head_lr},
+                {"params": to_gaussians_params, "lr": self.train_cfg.to_gaussians_lr},
+                {"params": depth_decoder_params, "lr": self.train_cfg.depth_decoder_lr},
+                {"params": high_resolution_skip0_params, "lr": self.train_cfg.high_resolution_skip0_lr},
             ]
-            trainable_params = importance_params + to_gaussians_params
-            max_lrs = [1e-4, 1e-5]
-            print("LR groups: importance_head=1e-4, to_gaussians=1e-5")
+            trainable_params = (
+                importance_params
+                + to_gaussians_params
+                + depth_decoder_params
+                + high_resolution_skip0_params
+            )
+            max_lrs = [
+                self.train_cfg.importance_head_lr,
+                self.train_cfg.to_gaussians_lr,
+                self.train_cfg.depth_decoder_lr,
+                self.train_cfg.high_resolution_skip0_lr,
+            ]
+            print(
+                "LR groups: "
+                f"importance_head={self.train_cfg.importance_head_lr}, "
+                f"to_gaussians={self.train_cfg.to_gaussians_lr}, "
+                f"depth_decoder.conv_last={self.train_cfg.depth_decoder_lr}, "
+                f"high_resolution_skip0={self.train_cfg.high_resolution_skip0_lr}"
+            )
         else:
             trainable_params = [p for p in self.parameters() if p.requires_grad]
             if len(trainable_params) == 0:

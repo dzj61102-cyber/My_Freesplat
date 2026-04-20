@@ -17,6 +17,8 @@ budget_pruning:
   tau_end: 0.2
   total_steps: 300000
 
+use_voxel_aggregation: true
+
 num_surfaces: 1
 
 gaussian_adapter:

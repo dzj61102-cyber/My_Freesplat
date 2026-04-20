@@ -53,10 +53,12 @@ class Benchmarker:
             json.dump(new_benchmarks, f)
         self.benchmarks = new_benchmarks
 
-    def dump_memory(self, path: Path) -> None:
+    def dump_memory(self, path: Path, peak_memory_bytes: float | None = None) -> None:
         path.parent.mkdir(exist_ok=True, parents=True)
+        if peak_memory_bytes is None:
+            peak_memory_bytes = torch.cuda.memory_stats()["allocated_bytes.all.peak"]
         with path.open("w") as f:
-            json.dump(torch.cuda.memory_stats()["allocated_bytes.all.peak"], f)
+            json.dump(peak_memory_bytes, f)
 
     def summarize(self) -> None:
         for tag, times in self.execution_times.items():

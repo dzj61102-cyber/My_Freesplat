@@ -143,6 +143,7 @@ class EncoderFreeSplatCfg:
     gaussian_adapter: GaussianAdapterCfg
     opacity_mapping: OpacityMappingCfg
     budget_pruning: BudgetPruningCfg
+    use_voxel_aggregation: bool = True
     
     # 深度离散采样数量（cost volume 深度 bin）
     num_depth_candidates: int = 64
@@ -305,7 +306,8 @@ class EncoderFreeSplat(Encoder[EncoderFreeSplatCfg]):
     def _compute_voxel_size_from_gaussians(
         self,
         gs: Gaussians,
-    ) -> tuple[Tensor, Tensor, Tensor]:
+    # ) -> tuple[Tensor, Tensor, Tensor]:
+    ) -> Tensor:
         """按规则计算体素边长（仅前两步：初始值 + 包围盒约束）。
 
         Returns:
@@ -319,12 +321,27 @@ class EncoderFreeSplat(Encoder[EncoderFreeSplatCfg]):
             -1, covariances.shape[-3], covariances.shape[-2], covariances.shape[-1]
         )[0]
 
-        # Step 1: v = 2 * median((x1*x2*x3)^(1/6))
-        eigvals = torch.linalg.eigvalsh(covariances).clamp_min(0.0)
-        scale_proxy = eigvals.prod(dim=-1).clamp_min(1e-24).pow(1.0 / 6.0)
-        m = torch.median(scale_proxy)
-        v_raw = 2.3 * m
+        # # # Step 1: v = 2 * median((x1*x2*x3)^(1/6))
+        # eigvals = torch.linalg.eigvalsh(covariances).clamp_min(0.0)
+        # scale_proxy = eigvals.prod(dim=-1).clamp_min(1e-24).pow(1.0 / 6.0)
+        # m = torch.median(scale_proxy)
+        # v_raw = 2.3 * m
+        # return v_raw
+
+        # 取协方差对角元素均值开方
+        diag_cov = covariances[..., 0, 0] + covariances[..., 1, 1] + covariances[..., 2, 2]
+        scale_proxy = torch.sqrt(diag_cov / 3.0).clamp_min(1e-12)
+        # 全局平均
+        m = scale_proxy.mean()
+        v_raw = 1.3 * m
         return v_raw
+
+        # # # 包围盒比例
+        # mu_max = means.max(dim=0).values
+        # mu_min = means.min(dim=0).values
+        # bbox_diag = torch.linalg.norm(mu_max - mu_min, ord=2)
+        # v_raw = 0.00015 * bbox_diag
+        # return v_raw
 
         # # Step 2: L = ||mu_max - mu_min||_2, 并限制 v 上下限
         # mu_max = means.max(dim=0).values
@@ -486,6 +503,7 @@ class EncoderFreeSplat(Encoder[EncoderFreeSplatCfg]):
                 torch.zeros(0, device=means.device, dtype=torch.long),
             )
 
+        # 统计体素内高斯数量，平均/最大/最小高斯数
         counts = torch.bincount(inverse, minlength=n_voxels).to(means.dtype)
         counts_long = counts.to(torch.long)
         if collect_pending_stats:
@@ -1054,49 +1072,52 @@ class EncoderFreeSplat(Encoder[EncoderFreeSplatCfg]):
         test_num_gaussians_aggregated = []
         test_voxel_pending_gaussians_stats = []
         test_voxel_gaussian_counts_per_voxel = []
-        aggregated_gs = []
         aggregated_scores = []
-        for idx, gs in enumerate(final_gs):
-            v_limited = self._compute_voxel_size_from_gaussians(gs)
-            # v_limited, v_raw, bbox_diag = self._compute_voxel_size_from_gaussians(gs)
-            # test_voxel_size.append(v_limited)
-            # test_voxel_size_raw.append(v_raw)
-            # test_bbox_diag.append(bbox_diag)
+        if self.cfg.use_voxel_aggregation:
+            aggregated_gs = []
+            for idx, gs in enumerate(final_gs):
+                v_limited = self._compute_voxel_size_from_gaussians(gs)
+                # v_limited, v_raw, bbox_diag = self._compute_voxel_size_from_gaussians(gs)
+                # test_voxel_size.append(v_limited)
+                # test_voxel_size_raw.append(v_raw)
+                # test_bbox_diag.append(bbox_diag)
 
-            if self.cfg.budget_pruning.enabled:
-                feat = fused_features[idx]
-                weight = fused_weights_flat[idx]
-                z = torch.cat(
-                    [feat, torch.log1p(weight).unsqueeze(-1), gs.opacities.unsqueeze(-1)],
-                    dim=-1,
+                if self.cfg.budget_pruning.enabled:
+                    feat = fused_features[idx]
+                    weight = fused_weights_flat[idx]
+                    z = torch.cat(
+                        [feat, torch.log1p(weight).unsqueeze(-1), gs.opacities.unsqueeze(-1)],
+                        dim=-1,
+                    )
+                    scores = self.importance_head(z).squeeze(-1)
+                else:
+                    # 若未启用 learned score，则回退到 opacity 作为重要性分数。
+                    scores = gs.opacities
+
+                gs_agg, s_agg, n_agg, c_stats, counts_per_voxel = self._voxel_aggregate_gaussians(
+                    gs, scores, v_limited, tau=0.5, collect_pending_stats=is_testing
                 )
-                scores = self.importance_head(z).squeeze(-1)
-            else:
-                # 若未启用 learned score，则回退到 opacity 作为重要性分数。
-                scores = gs.opacities
+                aggregated_gs.append(gs_agg)
+                aggregated_scores.append(s_agg)
+                test_num_gaussians_aggregated.append(n_agg)
+                if is_testing:
+                    test_voxel_pending_gaussians_stats.append(c_stats)
+                    test_voxel_gaussian_counts_per_voxel.append(counts_per_voxel)
 
-            gs_agg, s_agg, n_agg, c_stats, counts_per_voxel = self._voxel_aggregate_gaussians(
-                gs, scores, v_limited, tau=0.5, collect_pending_stats=is_testing
-            )
-            aggregated_gs.append(gs_agg)
-            aggregated_scores.append(s_agg)
-            test_num_gaussians_aggregated.append(n_agg)
+            final_gs = aggregated_gs
+            # 注意：不再在体素聚合后覆盖 results["fused_num_gaussians"]，
+            # 保持其“PTF 融合后、后处理前”的固定语义。
+            results["test_num_gaussians_aggregated"] = test_num_gaussians_aggregated
             if is_testing:
-                test_voxel_pending_gaussians_stats.append(c_stats)
-                test_voxel_gaussian_counts_per_voxel.append(counts_per_voxel)
+                results["test_voxel_pending_gaussians_stats"] = test_voxel_pending_gaussians_stats
+                results["test_voxel_gaussian_counts_per_voxel"] = test_voxel_gaussian_counts_per_voxel
+        else:
+            for gs in final_gs:
+                # 不做重要性打分与体素聚合，直接使用融合后的高斯渲染。
+                aggregated_scores.append(gs.opacities)
 
-        final_gs = aggregated_gs
         results["gaussians"] = final_gs
         results["gaussians_importance_scores"] = aggregated_scores
-        # 注意：不再在体素聚合后覆盖 results["fused_num_gaussians"]，
-        # 保持其“PTF 融合后、后处理前”的固定语义。
-        # results["test_voxel_size"] = test_voxel_size
-        # results["test_voxel_size_raw"] = test_voxel_size_raw
-        # results["test_bbox_diag"] = test_bbox_diag
-        results["test_num_gaussians_aggregated"] = test_num_gaussians_aggregated
-        if is_testing:
-            results["test_voxel_pending_gaussians_stats"] = test_voxel_pending_gaussians_stats
-            results["test_voxel_gaussian_counts_per_voxel"] = test_voxel_gaussian_counts_per_voxel
         # 打印
         # print(f"[EncoderFreeSplat] results['gs_ratio']: {results['gs_ratio']}")
         # print(f"[EncoderFreeSplat] results['fused_num_gaussians']: {results['fused_num_gaussians']}")
